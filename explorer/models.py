@@ -9,7 +9,7 @@ import re
 
 import torch
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-0.8B")
+MODEL = os.environ.get("EXPLORER_MODEL", "LiquidAI/LFM2.5-350M")
 
 
 def model_slug(model_id):
@@ -63,11 +63,46 @@ class ModelAdapter:
         a = getattr(layer, "self_attn", None)
         return a.o_proj.in_features // a.head_dim if a is not None else layer.linear_attn.num_v_heads
 
+
+    def mixer(self, layer):
+        return self.mixer_out_proj(layer), self.n_heads(layer)
     def eos_token_id(self):
         return self.tok.eos_token_id
 
 
-ADAPTERS = {"qwen3_5": ModelAdapter, "qwen3_5_text": ModelAdapter}
+class Lfm2Adapter(ModelAdapter):
+    """LiquidAI LFM2: layers at m.model.layers, MLP at layer.feed_forward (w1/w3/w2),
+    pre-MLP norm at layer.ffn_norm (w scaling), final norm at m.model.embedding_norm,
+    mixer out projection at self_attn.out_proj (full_attention) or conv.out_proj (conv)."""
+
+    def down_proj(self, layer):
+        return layer.feed_forward.w2
+
+    def gate_up_weights(self, layer):
+        return layer.feed_forward.w1.weight, layer.feed_forward.w3.weight
+
+    def pre_mlp_norm_scale(self, layer):
+        return layer.ffn_norm.weight.float()
+
+    def final_norm(self):
+        return self.text_model.embedding_norm
+
+    def mixer_out_proj(self, layer):
+        if getattr(layer, "self_attn", None) is not None:
+            return layer.self_attn.out_proj
+        return layer.conv.out_proj
+
+    def n_heads(self, layer):
+        a = getattr(layer, "self_attn", None)
+        if a is not None:
+            return a.out_proj.in_features // a.head_dim
+        return 0
+
+
+ADAPTERS = {"qwen3_5": ModelAdapter, "qwen3_5_text": ModelAdapter, "lfm2": Lfm2Adapter}
+_REGISTRY = ADAPTERS
+ADAPTERS_MAP = ADAPTERS
+ADAPTER_REGISTRY = ADAPTERS
 
 
 def adapter_for(model, tok=None):
@@ -77,7 +112,9 @@ def adapter_for(model, tok=None):
     return ADAPTERS[mt](model, tok)
 
 
-_DOWN = re.compile(r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.down_proj\.weight$")
+_DOWN = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.(?:mlp\.down_proj|feed_forward\.w2|shared_mlp\.output_linear)\.weight$"
+)
 
 
 def _local_safetensors(model_id):
@@ -98,10 +135,25 @@ def arch_from_model_or_config(model_id):
     config's when the weights are not on disk, plus the config's head counts and layer types."""
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(model_id).get_text_config()
-    arch = {"n_layers": cfg.num_hidden_layers, "hidden": cfg.hidden_size, "inter": cfg.intermediate_size,
-            "vocab_size": cfg.vocab_size, "layer_types": list(cfg.layer_types), "attn_heads": cfg.num_attention_heads,
-            "kv_heads": cfg.num_key_value_heads, "linear_k_heads": cfg.linear_num_key_heads,
-            "linear_v_heads": cfg.linear_num_value_heads}
+    inter = cfg.intermediate_size
+    if getattr(cfg, "block_auto_adjust_ff_dim", False):
+        inter = int(2 * inter / 3)
+        mult = getattr(cfg, "block_ffn_dim_multiplier", None)
+        if mult is not None:
+            inter = int(mult * inter)
+        b_mult = getattr(cfg, "block_multiple_of", 256)
+        inter = b_mult * ((inter + b_mult - 1) // b_mult)
+    arch = {
+        "n_layers": cfg.num_hidden_layers,
+        "hidden": cfg.hidden_size,
+        "inter": inter,
+        "vocab_size": cfg.vocab_size,
+        "layer_types": list(getattr(cfg, "layer_types", [])),
+        "attn_heads": getattr(cfg, "num_attention_heads", None),
+        "kv_heads": getattr(cfg, "num_key_value_heads", None),
+        "linear_k_heads": getattr(cfg, "linear_num_key_heads", None),
+        "linear_v_heads": getattr(cfg, "linear_num_value_heads", None),
+    }
     from safetensors import safe_open
     layers, shape = set(), None
     for path in _local_safetensors(model_id):

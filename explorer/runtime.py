@@ -114,14 +114,37 @@ class Runtime:
             if not mine:
                 return None
             h = inp[0].clone()
+            if n_heads == 0:
+                for _, head, scale in mine:
+                    if head is None or head == "all":
+                        h.mul_(scale)
+                return (h,)
             v = h.view(*h.shape[:-1], n_heads, h.shape[-1] // n_heads)
             for _, head, scale in mine:
-                if head is None:
+                if head is None or head == "all":
                     v.mul_(scale)
                 else:
                     v[..., head, :] *= scale
             return (h,)
         return hook
+
+    def _validate_heads(self, heads):
+        if not heads:
+            return None
+        norm = []
+        for item in heads:
+            l, hd, scale = item[0], item[1], item[2]
+            nh = self.n_heads(l)
+            layer_types = self.arch.get("layer_types", [])
+            ltype = layer_types[l] if l < len(layer_types) else ("conv" if nh == 0 else "full_attention")
+            if hd in ("all", None):
+                norm.append((l, None, float(scale)))
+            else:
+                hd_int = int(hd)
+                if not (0 <= hd_int < nh):
+                    raise ValueError(f"layer {l} has {nh} heads ({ltype})")
+                norm.append((l, hd_int, float(scale)))
+        return norm
 
     def n_heads(self, layer):
         return self.adapter.n_heads(self.lm.layers[layer])
@@ -143,6 +166,7 @@ class Runtime:
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
+            self.ensure_loaded()
             ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
             self._seen["want_resid"] = layer
             with torch.inference_mode():
@@ -260,6 +284,7 @@ class Runtime:
         scale 0 = ablated. Only earlier layers can move the read (a same-layer MLP push lands after the capture; a
         same-layer head change lands before it)."""
         self.ensure_loaded()
+        norm_heads = self._validate_heads(heads)
         with self.lock:
             if chat:
                 ids = self.chat_ids(text)
@@ -267,7 +292,7 @@ class Runtime:
                 ids = self.tok(text).input_ids
             self._read = (layer, n)
             self._push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
-            self._heads = list(heads) or None if heads else None
+            self._heads = norm_heads
             try:
                 with torch.inference_mode():
                     self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
@@ -287,6 +312,7 @@ class Runtime:
         reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
         the same distribution under that intervention: (base, intervened or None)."""
         self.ensure_loaded()
+        norm_heads = self._validate_heads(heads)
         ids = self.chat_ids(text) if chat else self.tok(text).input_ids
         if prefix:
             ids = ids + self.tok(prefix, add_special_tokens=False).input_ids
@@ -305,7 +331,7 @@ class Runtime:
         if not pushes and not heads:
             return base, None
         push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
-        return base, run(push, list(heads) if heads else None)
+        return base, run(push, norm_heads)
 
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
