@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .DS_Store
+.codegraph/
 
 # sweep data and derived files
 runs/
