@@ -44,8 +44,13 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     if (!p) return hideTip();
     if (p.type === "block") {
       if (hoverKey) { hoverKey = null; map.setHoverConnections(null); }
-      const full = p.full;
-      return showTip(x, y, `L${p.layer}`, full ? `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads` : `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`);
+      const mixer = p.mixer || (p.full ? "full_attention" : "linear_attention");
+      let desc;
+      if (mixer === "full_attention") desc = `full attention · ${arch.attn_heads} q / ${arch.kv_heads} kv heads`;
+      else if (mixer === "linear_attention") desc = `linear attention · ${arch.linear_k_heads} k / ${arch.linear_v_heads} v heads`;
+      else if (mixer === "conv") desc = `conv mixer`;
+      else desc = `${mixer} mixer`;
+      return showTip(x, y, `L${p.layer}`, desc);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
     const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;

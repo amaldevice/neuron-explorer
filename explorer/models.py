@@ -79,6 +79,45 @@ class ModelAdapter:
         return self.tok.eos_token_id
 
 
+class Lfm2Adapter(ModelAdapter):
+    """LiquidAI LFM2: layers at m.model.layers, MLP at layer.feed_forward (w1/w3/w2),
+    pre-MLP norm at layer.ffn_norm (w scaling), final norm at m.model.embedding_norm,
+    mixer out projection at self_attn.out_proj (full_attention) or conv.out_proj (conv)."""
+
+    def down_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return layer.feed_forward.w2
+
+    def gate_up_weights(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return layer.feed_forward.w1.weight, layer.feed_forward.w3.weight
+
+    def pre_mlp_norm_scale(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return layer.ffn_norm.weight.float()
+
+    def final_norm(self):
+        return self.text_model.embedding_norm
+
+    def mixer_out_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        if getattr(layer, "self_attn", None) is not None:
+            return layer.self_attn.out_proj
+        return layer.conv.out_proj
+
+    def n_heads(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        a = getattr(layer, "self_attn", None)
+        if a is not None:
+            return a.out_proj.in_features // a.head_dim
+        return 0
+
+
 class GraniteMoeHybridAdapter(ModelAdapter):
     """Granite-4.0 / Granite-4.0-H: layers at m.model.layers, MLP at layer.shared_mlp (input_linear / output_linear),
     standard pre-MLP norm (w) at post_attention_layernorm, final norm at m.model.norm, token mixer at self_attn.o_proj
@@ -131,12 +170,15 @@ class GraniteMoeHybridAdapter(ModelAdapter):
         raise ValueError(f"layer {layer} has neither self_attn nor mamba mixer")
 
 
-_REGISTRY = {
+ADAPTERS = {
     "qwen3_5": ModelAdapter,
     "qwen3_5_text": ModelAdapter,
+    "lfm2": Lfm2Adapter,
     "granitemoehybrid": GraniteMoeHybridAdapter,
 }
-ADAPTERS = _REGISTRY
+_REGISTRY = ADAPTERS
+ADAPTERS_MAP = ADAPTERS
+ADAPTER_REGISTRY = ADAPTERS
 
 
 def adapter_for(model, tok=None):
@@ -147,7 +189,7 @@ def adapter_for(model, tok=None):
 
 
 _DOWN = re.compile(
-    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.(?:mlp\.down_proj|shared_mlp\.output_linear|feed_forward\.w2)\.weight$"
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.(?:mlp\.down_proj|feed_forward\.w2|shared_mlp\.output_linear)\.weight$"
 )
 
 
@@ -170,6 +212,13 @@ def arch_from_model_or_config(model_id):
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(model_id).get_text_config()
     inter = getattr(cfg, "shared_intermediate_size", getattr(cfg, "intermediate_size", None))
+    if getattr(cfg, "block_auto_adjust_ff_dim", False):
+        inter = int(2 * inter / 3)
+        mult = getattr(cfg, "block_ffn_dim_multiplier", None)
+        if mult is not None:
+            inter = int(mult * inter)
+        b_mult = getattr(cfg, "block_multiple_of", 256)
+        inter = b_mult * ((inter + b_mult - 1) // b_mult)
     ltypes = list(getattr(cfg, "layer_types", []))
     if getattr(cfg, "model_type", None) == "granitemoehybrid":
         ltypes = [
@@ -182,8 +231,8 @@ def arch_from_model_or_config(model_id):
         "inter": inter,
         "vocab_size": cfg.vocab_size,
         "layer_types": ltypes,
-        "attn_heads": cfg.num_attention_heads,
-        "kv_heads": cfg.num_key_value_heads,
+        "attn_heads": getattr(cfg, "num_attention_heads", None),
+        "kv_heads": getattr(cfg, "num_key_value_heads", None),
         "linear_k_heads": getattr(cfg, "linear_num_key_heads", None),
         "linear_v_heads": getattr(cfg, "linear_num_value_heads", None),
     }
