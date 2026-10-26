@@ -1,61 +1,72 @@
 # neuron explorer
 
-Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
-rollout is kept, and the explorer lays the results out over a 3D view of the model.
+Steering-first neuron explorer for transformer, linear-attention, Mamba, and convolution hybrid language models.
+Every MLP neuron in a layer can be pushed up and down, activations inspected across arbitrary text, and causal
+connections mapped over a live 3D view of the model.
 
 ![neuron explorer](explorer.png)
 
-## Explorer
+## Quickstart
 
-    uv sync
-    uv run python explorer/server.py        # http://localhost:8791
+```bash
+uv sync
+uv run python explorer/server.py        # http://localhost:8791
+```
 
-Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
-`explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
-steered chat, lens, connections and live inference over your own text.
+By default on Apple Silicon, the server loads `LiquidAI/LFM2.5-350M` on MPS (using ~700 MB RAM at >600 tok/s batched).
+It automatically builds missing **Model artifacts** (`vocab.json`, `lens_index.npz`, `connections.npz`, and `act_scale.npz`)
+under `explorer/cache/<slug>/` on startup.
 
-- **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
-  steer lens and logit lens; click opens it; click a layer's label to view its sheet face-on. `writes` places
-  neurons with similar down-projection columns next to each other.
-- **list**: units ranked by word-cluster mass against random-direction controls; `lens` searches the steer and logit
-  lenses for a token, `fires` runs your text through the model and filters neurons by activation.
-- **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
-  connections, and a name.
-- **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
-  live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
-  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
-  `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
-  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+### Environment Options
 
-## Sweep
+| Variable | Description | Default |
+|---|---|---|
+| `EXPLORER_MODEL` | **Subject model** to load (`LiquidAI/LFM2.5-350M`, `Qwen/Qwen3.5-0.8B`, `ibm-granite/granite-4.0-350m`, `ibm-granite/granite-4.0-h-350m`, `Qwen/Qwen3.5-4B`) | `LiquidAI/LFM2.5-350M` |
+| `EXPLORER_AGENT` | CLI powering the assistant panel (`omp`, `pi`, or `claude`) | Auto-detected on `PATH` (`omp` → `pi` → `claude`) |
+| `EXPLORER_AGENT_MODEL` | Model selector passed to the agent CLI (e.g. `openai/gpt-5.6-luna`, `claude-sonnet-5-5`) | CLI default / `EXPLORER_CLAUDE_MODEL` |
+| `EXPLORER_NO_MODEL` | Run cache/metadata-only without loading PyTorch model weights | `0` |
+| `PORT` | Local HTTP listen port | `8791` |
 
-Runs on a CUDA 13 GPU pod with the steering fork of vLLM ([RhizoNymph/vllm](https://github.com/RhizoNymph/vllm)).
+## Features
 
-    bash sweep/setup_pod.sh                                   # fork, deps, model; writes /workspace/env.sh
-    python sweep/neuron_stats.py --layers 22 --tokens 2000000 --out stats/q35-4b
-    python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --design main_rel --dose-unit rel \
-        --neurons all --random-controls 256 --run q35-4b-L22
-    sweep/run_depth.sh "4 9 13 17" 384 64                     # random-subset sweep across several layers
+- **3D map**: Isometric visualization of decoder layers in perspective. Layer **Mixers** (`full_attention`, `linear_attention` GDN, `mamba` Mamba-2, and `conv` short-convolution) are rendered with truthful slab proportions. Neurons are laid out on a natural $\lceil\sqrt{N}\rceil \times \lceil\sqrt{N}\rceil$ sheet. Hover shows live logit and steer lenses; click opens the neuron; click a layer label to view face-on. Mode `writes` clusters neurons with similar down-projection columns.
+- **Left panel**:
+  - `net`: Top connections web of the focused neuron, followed by the layer's neuron list. When offline rollout sweeps are present, units are ranked by sweep word-cluster $z$-score; when sweeps are absent, units are automatically ranked by **Live Causal KL divergence** ($\max(\text{kl\_up}, \text{kl\_down})$ from `steer_index.npz`) with steer-lens token previews.
+  - `run`: `fires` runs arbitrary user text through the model, capturing activations across all layers with a 1024-token safety clamp.
+- **Neuron focus**:
+  - `Chat`: 3-column multi-turn steered conversation (−0.8, baseline, +0.8) with `add` (including `residual_multiplier` compensation on Granite) and `mul` modes.
+  - `Details`: Live logit and steer lenses, activation extremes, and direct-path upstream (`reads_from`) / downstream (`writes_into`) connection links with $z$-scores. When sweep data is present, displays word crumbs and dose tables.
+  - `Examples`: Steered rollouts per prompt and dose (automatically hidden if no sweep rollouts exist).
+- **Embeddings**: UMAP projection of a layer's rollouts (hidden when no sweep runs exist).
+- **Agent panel**: In-app research assistant driven by **`omp`**, **`pi`**, or **`claude`** via the stdio MCP bridge (`explorer/agent_mcp.py`). Streams tokens live, displays tool calls, reads neuron cones, runs live steering/activations, controls UI selection/highlights, and supports `@file` attachments, turn interruption, and session rewind (`/api/agent/rewind`).
 
-`main_rel` doses are fractions of the median residual norm leaving the layer: {who, snake, orange} × {−0.7, +0.5, +0.8}
-and {free} × {+3}, plus one unsteered baseline per prompt.
+## Model Artifacts
 
-| script | output |
-|---|---|
-| `sweep/neuron_stats.py` | per-neuron activation extremes by sign regime, down columns, residual norms |
-| `sweep/steer_sweep.py` | `runs/<run>.jsonl`: text, token ids, logprobs, top-k per step; optional activation captures |
-| `sweep/rank.py` | `runs/<run>.units.jsonl`: distinctive words, cluster mass, percentile against controls |
-| `sweep/steer_lens.py` | `stats/steer_lens_L{l}.npz`: next-token Δlogprob and KL for ±0.8 pushes on every neuron |
-| `sweep/depth_report.py` | `runs/depth_report.json`: per-layer share of neurons above controls, coherence, top units |
-| `sweep/shift.py` | word-shift score against controls, all words counted |
-| `sweep/merge_runs.py` | joins sharded runs of one layer |
-| `sweep/check_equivalence.py` | HF vs vLLM steering and capture agreement |
-| `sweep/bench.py`, `sweep/peek.py` | throughput conditions; terminal views of a run |
-| `explorer/build_embeddings.py` | `runs/<run>.umap.json` |
-| `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
-| `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
-| `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
+All precomputed arrays bound to a Subject model are isolated under `explorer/cache/<slug>/` (`<slug> = model_id.lower().replace('/', '--')`):
+- `vocab.json`: Model vocabulary strings
+- `lens_index.npz`: Logit-lens top tokens per neuron
+- `steer_index.npz`: Causal next-token push tokens and KL divergence from `sweep/steer_lens.py`
+- `connections.npz`: Direct-path top-24 upstream and downstream links
+- `act_scale.npz`: Typical activation ranges from FineWeb-Edu calibration
+- `layout_writes.npz`: 2D UMAP layout snapped to the sheet grid
+- `names.json`: Per-model user and agent neuron names
 
-`research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
+Every artifact loader validates array dimensions against `(n_layers, inter)` on load to guarantee shape safety.
+
+## Causal Steer Lens & Offline Sweeps
+
+1. **Fast Causal Steer Lens (Local MPS / Cloud GPU):**
+   ```bash
+   uv run python sweep/steer_lens.py --model LiquidAI/LFM2.5-350M
+   ```
+   Runs in ~4–6 minutes for all 16 layers of `LFM2.5-350M` on an Apple Silicon GPU (or ~1–2 minutes on free Kaggle/Colab T4 GPUs in `float16`/`bfloat16`), producing `steer_index.npz` and powering instant causal KL neuron rankings.
+
+2. **Full Rollout Sweeps:**
+   - **Local MPS**: Run adapter-backed subset sweeps for quick experimentation.
+   - **Cloud GPU (Kaggle 2× T4 16 GB / Colab 1× T4 15 GB / Modal)**: Run multi-layer batched sweeps without compilation dependencies (see `docs/adr/0001-pytorch-mps-runtime-and-deferred-sweeps.md`). Optional high-throughput patches for the `RhizoNymph/vllm` steering fork are documented in `docs/adr/`.
+
+## Architecture & Conventions
+
+- Domain definitions: `GLOSSARY.md` (**Subject model**, **Agent**, **Model artifact**, **Mixer**)
+- ADRs: `docs/adr/0001-pytorch-mps-runtime-and-deferred-sweeps.md`
+- Source methodology: `NOTES.md` and `research_log.md`
