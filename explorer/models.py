@@ -40,26 +40,38 @@ class ModelAdapter:
         return self.text_model.layers
 
     def down_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         return layer.mlp.down_proj
 
     def gate_up_weights(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         return layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight
 
     def pre_mlp_norm_scale(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         return 1.0 + layer.post_attention_layernorm.weight.float()
 
     def mlp_scale(self, layer):
         """Factor the MLP output is multiplied by before joining the residual stream (1 unless the family has one)."""
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         return float(getattr(layer, "residual_multiplier", 1.0))
 
     def final_norm(self):
         return self.text_model.norm
 
     def mixer_out_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         a = getattr(layer, "self_attn", None)
         return a.o_proj if a is not None else layer.linear_attn.out_proj
 
     def n_heads(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
         a = getattr(layer, "self_attn", None)
         return a.o_proj.in_features // a.head_dim if a is not None else layer.linear_attn.num_v_heads
 
@@ -67,7 +79,64 @@ class ModelAdapter:
         return self.tok.eos_token_id
 
 
-ADAPTERS = {"qwen3_5": ModelAdapter, "qwen3_5_text": ModelAdapter}
+class GraniteMoeHybridAdapter(ModelAdapter):
+    """Granite-4.0 / Granite-4.0-H: layers at m.model.layers, MLP at layer.shared_mlp (input_linear / output_linear),
+    standard pre-MLP norm (w) at post_attention_layernorm, final norm at m.model.norm, token mixer at self_attn.o_proj
+    or mamba.out_proj."""
+
+    def down_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return layer.shared_mlp.output_linear
+
+    def gate_up_weights(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        gate, up = layer.shared_mlp.input_linear.weight.chunk(2, dim=0)
+        return gate, up
+
+    def pre_mlp_norm_scale(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return layer.post_attention_layernorm.weight.float()
+
+    def mlp_scale(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        return float(getattr(layer, "residual_multiplier", 1.0))
+
+    def final_norm(self):
+        return self.text_model.norm
+
+    def mixer_out_proj(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        a = getattr(layer, "self_attn", None)
+        if a is not None:
+            return a.o_proj
+        m = getattr(layer, "mamba", None)
+        if m is not None:
+            return m.out_proj
+        raise ValueError(f"layer {layer} has neither self_attn nor mamba mixer")
+
+    def n_heads(self, layer):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        a = getattr(layer, "self_attn", None)
+        if a is not None:
+            return a.o_proj.in_features // a.head_dim
+        m = getattr(layer, "mamba", None)
+        if m is not None:
+            return m.num_heads
+        raise ValueError(f"layer {layer} has neither self_attn nor mamba mixer")
+
+
+_REGISTRY = {
+    "qwen3_5": ModelAdapter,
+    "qwen3_5_text": ModelAdapter,
+    "granitemoehybrid": GraniteMoeHybridAdapter,
+}
+ADAPTERS = _REGISTRY
 
 
 def adapter_for(model, tok=None):
@@ -77,7 +146,9 @@ def adapter_for(model, tok=None):
     return ADAPTERS[mt](model, tok)
 
 
-_DOWN = re.compile(r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.down_proj\.weight$")
+_DOWN = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.(?:mlp\.down_proj|shared_mlp\.output_linear|feed_forward\.w2)\.weight$"
+)
 
 
 def _local_safetensors(model_id):
@@ -98,10 +169,24 @@ def arch_from_model_or_config(model_id):
     config's when the weights are not on disk, plus the config's head counts and layer types."""
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(model_id).get_text_config()
-    arch = {"n_layers": cfg.num_hidden_layers, "hidden": cfg.hidden_size, "inter": cfg.intermediate_size,
-            "vocab_size": cfg.vocab_size, "layer_types": list(cfg.layer_types), "attn_heads": cfg.num_attention_heads,
-            "kv_heads": cfg.num_key_value_heads, "linear_k_heads": cfg.linear_num_key_heads,
-            "linear_v_heads": cfg.linear_num_value_heads}
+    inter = getattr(cfg, "shared_intermediate_size", getattr(cfg, "intermediate_size", None))
+    ltypes = list(getattr(cfg, "layer_types", []))
+    if getattr(cfg, "model_type", None) == "granitemoehybrid":
+        ltypes = [
+            "mamba" if lt in ("linear_attention", "mamba") else ("full_attention" if lt == "attention" else lt)
+            for lt in ltypes
+        ]
+    arch = {
+        "n_layers": cfg.num_hidden_layers,
+        "hidden": cfg.hidden_size,
+        "inter": inter,
+        "vocab_size": cfg.vocab_size,
+        "layer_types": ltypes,
+        "attn_heads": cfg.num_attention_heads,
+        "kv_heads": cfg.num_key_value_heads,
+        "linear_k_heads": getattr(cfg, "linear_num_key_heads", None),
+        "linear_v_heads": getattr(cfg, "linear_num_value_heads", None),
+    }
     from safetensors import safe_open
     layers, shape = set(), None
     for path in _local_safetensors(model_id):
