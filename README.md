@@ -31,7 +31,7 @@ under `explorer/cache/<slug>/` on startup.
 
 - **3D map**: Isometric visualization of decoder layers in perspective. Layer **Mixers** (`full_attention`, `linear_attention` GDN, `mamba` Mamba-2, and `conv` short-convolution) are rendered with truthful slab proportions. Neurons are laid out on a natural $\lceil\sqrt{N}\rceil \times \lceil\sqrt{N}\rceil$ sheet. Hover shows live logit and steer lenses; click opens the neuron; click a layer label to view face-on. Mode `writes` clusters neurons with similar down-projection columns.
 - **Left panel**:
-  - `net`: Top connections web of the focused neuron, followed by the layer's neuron list. When offline rollout sweeps are present, units are ranked by sweep word-cluster $z$-score; when sweeps are absent, units are automatically ranked by **Live Causal KL divergence** ($\max(\text{kl\_up}, \text{kl\_down})$ from `steer_index.npz`) with steer-lens token previews.
+  - `net`: Top connections web of the focused neuron, followed by the layer's neuron list. When offline rollout sweeps are present, units are ranked by sweep word-cluster $z$-score; when sweeps are absent, units are automatically ranked by **Live Causal KL divergence** (`max(kl_up, kl_down)` from `steer_index.npz`) with steer-lens token previews.
   - `run`: `fires` runs arbitrary user text through the model, capturing activations across all layers with a 1024-token safety clamp.
 - **Neuron focus**:
   - `Chat`: 3-column multi-turn steered conversation (−0.8, baseline, +0.8) with `add` (including `residual_multiplier` compensation on Granite) and `mul` modes.
