@@ -23,7 +23,14 @@ if (Object.keys(index.layers).length === 0) {
   const eb = $('button[data-view="embed"]');
   if (eb) eb.style.display = "none";
 }
+const agentName = index.agent || "claude";
+const agentLabel = agentName === "claude" ? "Claude" : `Agent (${agentName})`;
 const tip = $("#tip");
+// the tab and the input say which agent CLI is answering
+const agentTabBtn = document.querySelector('#tabs button[data-tab="claude"]');
+if (agentTabBtn) agentTabBtn.textContent = agentLabel;
+$("#a-input").placeholder = `Ask ${agentLabel}…`;
+$("#a-input").title = `while ${agentLabel} works: Enter interrupts and sends, ⌘/Ctrl+Enter queues`;
 
 // ---------- map ----------
 const map = createMap($("#map"), $("#layer-labels"), arch, {
@@ -853,6 +860,7 @@ function toolLabel(name, a = {}) {
   const ref = a.layer != null && a.n != null ? `L${a.layer} N${a.n}` : a.layer != null ? `L${a.layer}` : "";
   const short = t => (t.length > 90 ? t.slice(0, 90) + "…" : t);
   const extra = a.command ? short(a.command) : a.file_path ? a.file_path.replace(/^\/Users\/[^/]+/, "~")
+    : a.path ? String(a.path).replace(/^\/Users\/[^/]+/, "~")
     : a.pattern ? `"${a.pattern}"` : a.query ? `"${a.query}"` : a.neurons ? `${a.neurons.length} neurons` : "";
   return [name.replace(/_/g, " "), ref, extra].filter(Boolean).join(" ");
 }

@@ -155,7 +155,7 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": MODEL, "arch": ARCH,
+    return {"model": MODEL, "arch": ARCH, "agent": get_agent_name(),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -614,9 +614,29 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 # Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # the agent CLI's cwd, so no project settings or CLAUDE.md apply
 _chats = {}
 _act = {}
+
+
+def get_agent_name():
+    """Which Agent CLI this server talks to: EXPLORER_AGENT, else the first of omp, pi, claude on PATH."""
+    import shutil
+    want = (os.environ.get("EXPLORER_AGENT") or "").strip().lower()
+    if want in ("omp", "pi", "claude"):
+        return want
+    for b in ("omp", "pi", "claude"):
+        if shutil.which(b):
+            return b
+    return "claude"
+
+
+def get_agent_model():
+    """The model the agent CLI should use: EXPLORER_AGENT_MODEL, else the older EXPLORER_CLAUDE_MODEL."""
+    return os.environ.get("EXPLORER_AGENT_MODEL") or os.environ.get("EXPLORER_CLAUDE_MODEL") or ""
+
+
+AGENT_NAME = get_agent_name()
 
 
 def act_range(layer, n):
@@ -637,7 +657,7 @@ def act_range(layer, n):
 def agent_overview():
     runs = layer_runs()
     return {"model": MODEL, "arch": ARCH, "layers_with_sweeps": sorted(runs),
-            "named_neurons": len(names()), "live_model": not NO_MODEL}
+            "named_neurons": len(names()), "live_model": not NO_MODEL, "agent": get_agent_name()}
 
 
 @app.get("/api/agent/names")
@@ -903,6 +923,192 @@ async def agent_cancel(req: Request):
         await _stop_turn(c["proc"])
         return {"ok": True}
     return {"ok": False}
+def _write_if_changed(path, text):
+    if not os.path.exists(path) or open(path).read() != text:
+        with open(path, "w") as f:
+            f.write(text)
+    return path
+
+
+def _mcp_server_entry():
+    """The explorer MCP server, as both agent CLIs want it: stdio, with the per-chat env expanded at launch."""
+    return {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
+            "env": {"EXPLORER_URL": "${EXPLORER_URL}", "EXPLORER_CHAT": "${EXPLORER_CHAT}"}}
+
+
+def _setup_omp():
+    """omp's project config under AGENT_DIR: the explorer MCP server, and no context files or foreign tools."""
+    d = os.path.join(AGENT_DIR, ".omp")
+    os.makedirs(d, exist_ok=True)
+    _write_if_changed(os.path.join(d, "mcp.json"),
+                      json.dumps({"mcpServers": {"explorer": {"type": "stdio", **_mcp_server_entry()}}}, indent=1))
+    cfg = ("tools:\n  xdev: false\n  intentTracing: false\n"
+           "includeWorkspaceTree: false\n"
+           "disabledProviders:\n"
+           "  - claude\n  - claude-plugins\n  - codex\n  - gemini\n  - opencode\n"
+           "  - cursor\n  - windsurf\n  - cline\n  - github\n  - vscode\n  - agents\n"
+           "  - agents-md\n  - claude-md\n  - custom-context\n"
+           "disabledExtensions:\n"
+           "  - context-file:user:AGENTS.md\n  - context-file:user:CLAUDE.md\n"
+           "  - context-file:project:AGENTS.md\n  - context-file:project:CLAUDE.md\n"
+           "  - context-file:user:GEMINI.md\n  - context-file:project:GEMINI.md\n"
+           "  - context-file:user:copilot-instructions.md\n  - context-file:project:copilot-instructions.md\n"
+           "contextFiles:\n  extra: []\n")
+    _write_if_changed(os.path.join(d, "config.yml"), cfg)
+
+
+def _setup_pi():
+    """pi's project config under AGENT_DIR: the explorer MCP server, exposed directly to the model."""
+    d = os.path.join(AGENT_DIR, ".pi")
+    os.makedirs(d, exist_ok=True)
+    _write_if_changed(os.path.join(d, "mcp.json"),
+                      json.dumps({"mcpServers": {"explorer": {"exposure": "direct", **_mcp_server_entry()}}}, indent=1))
+
+
+def _upload_path(fid):
+    """The absolute path of an uploaded file, or None if that id is gone."""
+    fid = os.path.basename(str(fid))
+    meta_path = os.path.join(UPLOADS, f"{fid}.json")
+    if not os.path.exists(meta_path):
+        return None
+    meta = json.load(open(meta_path))
+    p = os.path.join(UPLOADS, f"{fid}-{meta['name']}")
+    return os.path.abspath(p) if os.path.exists(p) else None
+
+
+def _session_file(sid):
+    """The chat's session file: claude's own, or the v3 JSONL that omp / pi keep under AGENT_DIR/sessions."""
+    base = os.path.basename(str(sid))
+    backend = get_agent_name()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    direct = os.path.join(sessions, f"{base}.jsonl")  # omp writes the session where we point it
+    if backend == "omp":
+        return direct if os.path.exists(direct) else None
+    if backend == "pi":
+        hits = sorted(glob.glob(os.path.join(sessions, f"*_{base}.jsonl")))  # pi names it <timestamp>_<id>.jsonl
+        return hits[-1] if hits else None
+    hits = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), "*", f"{base}.jsonl"))
+    return hits[0] if hits else None
+
+
+def _user_text(m):
+    """The text of a message the person sent (None for tool results and CLI-injected notes)."""
+    if m.get("type") == "message":  # omp / pi v3 session entries
+        msg = m.get("message") or {}
+        if msg.get("role") != "user" or msg.get("attribution") not in (None, "user"):
+            return None
+        c = msg.get("content")
+    elif m.get("type") == "user" and not m.get("isMeta"):  # claude
+        c = (m.get("message") or {}).get("content")
+    else:
+        return None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list) and not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
+        # the first text block is what they typed; attached text files follow as blocks of their own
+        return next((x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"), "")
+    return None
+
+
+@app.post("/api/agent/rewind")
+async def agent_rewind(req: Request):
+    """Cut a chat's session back to just before the last message the person sent that ends with `text`
+    (everything after it goes too: the reply, a refusal, CLI notes). The cut session is backed up beside it first.
+    No match (already cut) is not an error. Works for claude, omp and pi session files."""
+    import shutil
+    import time
+    b = await req.json()
+    sid, text = b["chat"], (b.get("text") or "").strip()
+    path = _session_file(sid)
+    if not path:
+        return {"ok": True, "cut": False}
+    lines = open(path).read().splitlines(True)
+    at = None
+    for i in range(len(lines) - 1, -1, -1):
+        try:
+            t = _user_text(json.loads(lines[i]))
+        except ValueError:
+            continue
+        if t is not None and (not text or t.strip() == text or t.strip().endswith("\n\n" + text)
+                              or t.strip().endswith("\n" + text) or t.split("\n\n", 1)[-1].strip() == text
+                              or text in t):
+            at = i
+            break
+    if at is None:
+        return {"ok": True, "cut": False}
+    shutil.copy(path, f"{path}.bak-{int(time.time())}")
+    keep = lines[:at]
+    if not any(_user_text(json.loads(x)) is not None for x in keep if x.strip()):
+        os.remove(path)  # nothing the person said is left: the next turn starts the session afresh
+    else:
+        with open(path, "w") as f:
+            f.writelines(keep)
+    return {"ok": True, "cut": True}
+
+
+def _omp_cmd(cid, msg, atts):
+    """The omp command line: this chat's session file, our system prompt, the file tools, the attachments."""
+    _setup_omp()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    path = os.path.join(sessions, f"{os.path.basename(cid)}.jsonl")
+    if not os.path.exists(path):
+        # omp has no --session-id: it opens a pre-seeded v3 session file
+        _write_if_changed(path, json.dumps({"type": "session", "version": 3, "id": cid,
+                                            "timestamp": "1970-01-01T00:00:00.000Z", "cwd": AGENT_DIR}) + "\n")
+    cmd = ["omp", "-p", "--mode", "json", "--no-extensions", "--no-skills", "--no-rules", "--no-lsp", "--no-title",
+           "--system-prompt", agent_prompt_file(), "--tools", ",".join(FILE_TOOLS), "--resume", path]
+    if get_agent_model():
+        cmd += ["--model", get_agent_model()]
+    return cmd + [f"@{p}" for p in atts] + ["--", msg]
+
+
+def _pi_cmd(cid, msg, atts):
+    """The pi command line: this chat's session id, our system prompt, the file tools plus the explorer tools."""
+    _setup_pi()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    cmd = ["pi", "-p", "--mode", "json", "--approve", "--session-dir", sessions, "--session-id", os.path.basename(cid),
+           "-ne", "-e", "builtin:mcp", "--no-skills", "--no-prompt-templates", "--no-context-files",
+           "--system-prompt", agent_prompt_file(), "--tools", "read,find,grep,write,edit,bash,mcp__explorer__*"]
+    if get_agent_model():
+        cmd += ["--model", get_agent_model()]
+    # pi has no PDF block: it can only be told the path
+    pdfs = [p for p in atts if p.lower().endswith(".pdf")]
+    others = [p for p in atts if p not in pdfs]
+    if pdfs:
+        msg = msg + "".join(f"\n[Attached PDF: {p}]" for p in pdfs)
+    return cmd + [f"@{p}" for p in others] + ["--", msg]
+
+
+def _unified_events(m, state):
+    """One line of an omp / pi JSONL stream -> the browser's events. `state` carries the cost and the last
+    assistant message, so the turn can end with a cost and an error."""
+    t = m.get("type")
+    if t == "message_update":
+        ev = m.get("assistantMessageEvent") or {}
+        if ev.get("type") == "text_delta":
+            yield {"t": "text", "text": ev.get("delta") or ""}
+    elif t == "tool_execution_start":
+        name = (m.get("toolName") or "").removeprefix("mcp__explorer__").removeprefix("mcp__explorer_")
+        yield {"t": "tool", "id": m.get("toolCallId"), "input": m.get("args") or {}, "name": name}
+    elif t == "tool_execution_end":
+        res = m.get("result") or {}
+        out = "\n".join(x.get("text", "") for x in (res.get("content") or []) if isinstance(x, dict))
+        yield {"t": "tool_result", "id": m.get("toolCallId"), "error": bool(m.get("isError")),
+               "output": out[:1500] + (f" … ({len(out)} chars)" if len(out) > 1500 else "")}
+    elif t == "message_end" and (m.get("message") or {}).get("role") == "assistant":
+        msg = m["message"]
+        if msg.get("usage") is not None:
+            state["seen"] = True
+            state["cost"] += ((msg.get("usage").get("cost") or {}).get("total") or 0.0)
+        state["last"] = msg
+    elif t == "agent_end" and not m.get("willRetry") and m.get("isTerminal") is not False:
+        last = state.get("last") or {}
+        if last.get("stopReason") == "error":
+            yield {"t": "error", "error": str(last.get("errorMessage") or "agent error")[:600]}
+        yield {"t": "done", "cost": state["cost"] if state.get("seen") else None}
+        state["done"] = True
 
 
 @app.post("/api/agent/chat")
@@ -910,90 +1116,78 @@ async def agent_chat(req: Request):
     """One turn. Body: {chat?, message, layer?, n?, attachments?: [upload ids]}. Streams NDJSON events: chat, text,
     tool_use, tool_result, error, done."""
     b = await req.json()
-    cid = b.get("chat") or f"chat-{int(os.urandom(4).hex(), 16)}"
-    c = _chats.setdefault(cid, {"session": None, "proc": None, "events": asyncio.Queue()})
-    q = c["events"]
-    # empty out any leftover events from an interrupted turn
-    while not q.empty():
-        q.get_nowait()
-    loop = asyncio.get_running_loop()
-
-    # context block injected into the user turn so Claude knows what's on screen
-    ctx = []
-    if b.get("layer") is not None and b.get("n") is not None:
-        ctx.append(f"[Explorer focus: layer {b['layer']}, neuron {b['n']}]")
-    if b.get("attachments"):
-        ctx.append(f"[Attached in cwd: {', '.join(b['attachments'])}]")
-    full_prompt = ("\n".join(ctx) + "\n\n" if ctx else "") + (b.get("message") or "")
-
-    cmd = ["claude", "-p", full_prompt,
-           "--output-format", "stream-json",
-           "--permission-prompt-tool", "never",
-           "--system-prompt-file", AGENT_PROMPT]
-    if c["session"]:
-        cmd += ["--resume", c["session"]]
-    if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
-
-    # inject the explorer MCP tools into Claude's environment
-    env = dict(os.environ)
-    env["EXPLORER_PORT"] = str(PORT)
-    env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
-    cfg = {"mcpServers": {"explorer": {"command": sys.executable,
-                                        "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")]}}}
-    mcp_path = os.path.join(AGENT_DIR, ".claude_mcp.json")
+    # the chat id is the agent session id, so a chat the browser kept survives server restarts (it resumes)
+    cid = b.get("chat") or str(uuid.uuid4())
+    c = _chats.setdefault(cid, {"session": cid})
+    c["queue"] = q = asyncio.Queue()
+    msg = b["message"]
+    if b.get("layer") is not None:
+        msg = f"[The person has L{int(b['layer'])} N{int(b['n'])} open in the explorer.]\n\n{msg}"
     os.makedirs(AGENT_DIR, exist_ok=True)
-    with open(mcp_path, "w") as f:
-        json.dump(cfg, f)
-    cmd += ["--mcp-config", mcp_path]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd=AGENT_DIR, env=env, start_new_session=True
-    )
-    c["proc"] = proc
-
-    async def read_stdout():
-        assert proc.stdout is not None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            try:
-                ev = json.loads(line.decode())
-            except Exception:
-                continue
-            if ev.get("session_id"):
-                c["session"] = ev["session_id"]
-            await q.put(("stream", ev))
-        code = await proc.wait()
-        await q.put(("exit", code))
-
-    async def read_stderr():
-        assert proc.stderr is not None
-        err = await proc.stderr.read()
-        if err:
-            await q.put(("stderr", err.decode(errors="replace")))
-
-    task = asyncio.create_task(read_stdout())
-    asyncio.create_task(read_stderr())
+    backend = get_agent_name()
+    atts = [p for p in (_upload_path(a) for a in b.get("attachments") or []) if p]
+    env = {**os.environ, "EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}
+    if backend == "omp":
+        cmd = _omp_cmd(cid, msg, atts)
+    elif backend == "pi":
+        cmd = _pi_cmd(cid, msg, atts)
+    else:
+        mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
+                                           "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
+        content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
+        cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+               "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
+               # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
+               "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
+               "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
+        if get_agent_model():
+            cmd += ["--model", get_agent_model()]
 
     async def events():
+        # a turn that was interrupted may still be exiting; it holds the session until it does
+        await _stop_turn(c.get("proc"))
+        # claude resumes once the session exists on disk (any earlier turn, finished or interrupted, creates it)
+        sess = ["--resume", c["session"]] if (backend == "claude" and _session_file(c["session"])) else (
+            ["--session-id", c["session"]] if backend == "claude" else [])
+        # its own process group, so stopping a turn also stops what it started (MCP server, shell scripts)
+        proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, *sess, cwd=AGENT_DIR,
+                                                    stdin=asyncio.subprocess.PIPE if backend == "claude" else asyncio.subprocess.DEVNULL,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                                                    env=env, limit=1 << 24, start_new_session=True)
+        if backend == "claude":
+            proc.stdin.write((json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+        async def pump():
+            async for line in proc.stdout:
+                q.put_nowait(("line", line))
+            q.put_nowait(("end", (await proc.stderr.read()).decode(errors="replace")))
+        task = asyncio.create_task(pump())
         yield json.dumps({"t": "chat", "chat": cid}) + "\n"
+        state = {"cost": 0.0, "last": None, "done": False, "seen": False}
         try:
             while True:
                 kind, item = await q.get()
                 if kind == "ui":
                     yield json.dumps({"t": "ui", **item}) + "\n"
                     continue
-                if kind == "exit":
+                if kind == "end":
+                    rc = await proc.wait()
+                    if rc != 0 and not state["done"]:
+                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"{backend} exited {rc}"}) + "\n"
+                    if not state["done"]:
+                        yield json.dumps({"t": "done", "cost": state["cost"] if state["seen"] else None}) + "\n"
                     break
                 if kind == "stderr":
                     # non-fatal diagnostics on stderr: surface only if they look like errors
                     if "error" in item.lower():
                         yield json.dumps({"t": "stderr", "text": item[:400]}) + "\n"
                     continue
-                m = item
+                if backend != "claude":
+                    for ev in _unified_events(m, state):
+                        yield json.dumps(ev) + "\n"
+                    continue
                 if m.get("type") == "stream_event":
                     ev = m.get("event") or {}
                     if ev.get("type") == "content_block_delta":
