@@ -882,37 +882,83 @@ async def agent_ui(req: Request):
     return {"ok": True, "note": "shown in the explorer"}
 
 
+UPLOADS = os.path.join(AGENT_DIR, "uploads")
+FILE_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
+
+
 @app.post("/api/agent/upload")
 async def agent_upload(req: Request):
-    """File upload into Claude's working directory. Multipart form, field `file`."""
-    form = await req.form()
-    f = form.get("file")
-    if not f:
-        return PlainTextResponse("missing file", status_code=400)
-    os.makedirs(AGENT_DIR, exist_ok=True)
-    # sanitise filename: basename only, no dotfiles
-    name = os.path.basename(f.filename or "upload")
-    name = "".join(c for c in name if c.isalnum() or c in ".-_ ").strip() or "upload"
-    path = os.path.join(AGENT_DIR, name)
-    content = await f.read()
-    with open(path, "wb") as out:
-        out.write(content)
-    return {"name": name, "size": len(content), "path": path}
+    """A file for the chat, sent as base64 JSON {name, type, data}; kept under explorer/cache/agent/uploads."""
+    import base64
+    import uuid
+    b = await req.json()
+    raw = base64.b64decode(b["data"])
+    if len(raw) > 25 << 20:
+        return JSONResponse({"error": "file over 25 MB"}, status_code=413)
+    os.makedirs(UPLOADS, exist_ok=True)
+    fid = uuid.uuid4().hex[:12]
+    name = os.path.basename(b.get("name") or "file")
+    with open(os.path.join(UPLOADS, f"{fid}-{name}"), "wb") as f:
+        f.write(raw)
+    with open(os.path.join(UPLOADS, f"{fid}.json"), "w") as f:
+        json.dump({"name": name, "type": b.get("type") or "", "size": len(raw)}, f)
+    return {"id": fid, "name": name, "size": len(raw)}
+
+
+def attachment_block(fid):
+    """An uploaded file as a message content block: images and PDFs as themselves, anything else as text."""
+    import base64
+    fid = os.path.basename(str(fid))
+    meta_path = os.path.join(UPLOADS, f"{fid}.json")
+    if not os.path.exists(meta_path):
+        return None
+    meta = json.load(open(meta_path))
+    raw = open(os.path.join(UPLOADS, f"{fid}-{meta['name']}"), "rb").read()
+    kind = meta["type"]
+    if kind in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+        return {"type": "image", "source": {"type": "base64", "media_type": kind, "data": base64.b64encode(raw).decode()}}
+    if kind == "application/pdf" or meta["name"].lower().endswith(".pdf"):
+        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                               "data": base64.b64encode(raw).decode()}, "title": meta["name"]}
+    text = raw.decode("utf-8", errors="replace")
+    cut = 200_000
+    more = f"\n[... {len(text) - cut} more characters cut]" if len(text) > cut else ""
+    return {"type": "text", "text": f'<file name="{meta["name"]}">\n{text[:cut]}{more}\n</file>'}
+
+
+AGENT_METHOD = os.path.join(ROOT, "explorer", "agent_methodology.md")
+AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this machine's own additions, untracked
+
+
+def agent_prompt_file():
+    """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
+    this checkout's path, written beside the chat's working files."""
+    text = open(AGENT_PROMPT).read()
+    for extra in (AGENT_METHOD, AGENT_LOCAL):
+        if os.path.exists(extra):
+            text = text.rstrip() + "\n\n" + open(extra).read()
+    text = text.replace("{ROOT}", ROOT)
+    out = os.path.join(AGENT_DIR, "system_prompt.md")
+    if not os.path.exists(out) or open(out).read() != text:
+        with open(out, "w") as f:
+            f.write(text)
+    return out
 
 
 async def _stop_turn(proc):
-    if not proc or proc.returncode is not None:
-        return
     import signal
-    try:
-        proc.send_signal(signal.SIGINT)
-        for _ in range(30):
-            if proc.returncode is not None:
-                return
-            await asyncio.sleep(0.05)
-        proc.terminate()
-    except (ProcessLookupError, PermissionError):
-        pass
+    if proc is None or proc.returncode is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+            return
+        except asyncio.TimeoutError:
+            pass
 
 
 @app.post("/api/agent/cancel")
@@ -1183,6 +1229,10 @@ async def agent_chat(req: Request):
                     # non-fatal diagnostics on stderr: surface only if they look like errors
                     if "error" in item.lower():
                         yield json.dumps({"t": "stderr", "text": item[:400]}) + "\n"
+                    continue
+                try:
+                    m = json.loads(item)
+                except ValueError:
                     continue
                 if backend != "claude":
                     for ev in _unified_events(m, state):
