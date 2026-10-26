@@ -12,9 +12,14 @@ import threading
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+try:
+    from models import MODEL as DEFAULT_MODEL, adapter_for, arch_from_model_or_config, load_model, model_slug
+except ImportError:
+    from explorer.models import MODEL as DEFAULT_MODEL, adapter_for, arch_from_model_or_config, load_model, model_slug
+
+MODEL = os.environ.get("EXPLORER_MODEL", DEFAULT_MODEL)
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -23,21 +28,24 @@ REFERENCE_TEXT = (
     "    return out + a + b\nShe asked me what I thought of the plan, and I told her honestly that it seemed rushed. "
 )
 
-
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+SLUG = model_slug(MODEL)
+MODEL_CACHE = os.path.join(CACHE, SLUG)
+AGENT_CACHE = os.path.join(CACHE, "agent")
 
 
 class Runtime:
     def __init__(self, stats_dir):
         self.stats_dir = stats_dir
-        os.makedirs(CACHE, exist_ok=True)
-        self._db = sqlite3.connect(os.path.join(CACHE, "connections.sqlite"), check_same_thread=False)
+        self.arch = arch_from_model_or_config(MODEL)
+        os.makedirs(MODEL_CACHE, exist_ok=True)
+        self._db = sqlite3.connect(os.path.join(MODEL_CACHE, "connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
         self._db_lock = threading.Lock()
         self._lens_idx = None
         self._con_idx = None
         self.lock = threading.Lock()
-        self.model = self.tok = None
+        self.model = self.tok = self.adapter = None
         self.status = "idle"
         self.resid_p50 = {}
         self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
@@ -62,19 +70,16 @@ class Runtime:
             self.status = "loading"
             dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
             self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
-            for i, layer in enumerate(self.lm.layers):
-                layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
+            self.model = load_model(MODEL)
+            self.dev = dev
+            self.adapter = adapter_for(self.model, self.tok)
+            self.lm = self.adapter.text_model
+            for i, layer in enumerate(self.adapter.layers()):
+                self.adapter.down_proj(layer).register_forward_pre_hook(self._hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
-                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
+                proj = self.adapter.mixer_out_proj(layer)
+                heads = self.adapter.n_heads(layer)
+                proj.register_forward_pre_hook(self._head_hook(i, heads))
             self.status = "ready"
 
     def _hook(self, i):
@@ -109,18 +114,40 @@ class Runtime:
             if not mine:
                 return None
             h = inp[0].clone()
+            if n_heads == 0:
+                for _, head, scale in mine:
+                    if head is None or head == "all":
+                        h.mul_(scale)
+                return (h,)
             v = h.view(*h.shape[:-1], n_heads, h.shape[-1] // n_heads)
             for _, head, scale in mine:
-                if head is None:
+                if head is None or head == "all":
                     v.mul_(scale)
                 else:
                     v[..., head, :] *= scale
             return (h,)
         return hook
 
+    def _validate_heads(self, heads):
+        if not heads:
+            return None
+        norm = []
+        for item in heads:
+            l, hd, scale = item[0], item[1], item[2]
+            nh = self.n_heads(l)
+            layer_types = self.arch.get("layer_types", [])
+            ltype = layer_types[l] if l < len(layer_types) else ("conv" if nh == 0 else "full_attention")
+            if hd in ("all", None):
+                norm.append((l, None, float(scale)))
+            else:
+                hd_int = int(hd)
+                if not (0 <= hd_int < nh):
+                    raise ValueError(f"layer {l} has {nh} heads ({ltype})")
+                norm.append((l, hd_int, float(scale)))
+        return norm
+
     def n_heads(self, layer):
-        L = self.lm.layers[layer]
-        return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
+        return self.adapter.n_heads(self.lm.layers[layer])
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
@@ -132,10 +159,14 @@ class Runtime:
     def layer_resid_p50(self, layer):
         if layer in self.resid_p50:
             return self.resid_p50[layer]
-        path = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")
+        slug = model_slug(MODEL)
+        path = os.path.join(self.stats_dir, f"{slug}_L{layer}.npz")
+        if not os.path.exists(path) and MODEL == "Qwen/Qwen3.5-4B":
+            path = os.path.join(self.stats_dir, f"q35-4b_L{layer}.npz")
         if os.path.exists(path):
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
+            self.ensure_loaded()
             ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
             self._seen["want_resid"] = layer
             with torch.inference_mode():
@@ -146,7 +177,7 @@ class Runtime:
         return v
 
     def down_col(self, layer, n):
-        return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+        return self.adapter.down_proj(self.lm.layers[layer]).weight[:, n].detach().float()
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
@@ -156,13 +187,13 @@ class Runtime:
         enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
         return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
 
-    def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=200, cancel=None):
+    def steer_stream(self, layer, n, rows_messages, dose, mode, max_new=150, cancel=None):
         """Greedy-decodes three conversations in one batch: row 0 pushed up, row 1 unsteered, row 2 pushed down.
         rows_messages holds each row's own message list (the rows can differ in length; they are left-padded).
         Yields (row, text_delta), then (None, None)."""
         yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
 
-    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
+    def steer_multi(self, pushes, rows_messages, max_new=150, cancel=None):
         """steer_stream for any number of neurons at once: pushes = [(layer, n, dose, mode)], all applied together.
         Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose)."""
         self.ensure_loaded()
@@ -178,7 +209,7 @@ class Runtime:
                 ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
-                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
+                eos = self.adapter.eos_token_id()
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
                 self._push = push
                 with torch.inference_mode():
@@ -241,7 +272,8 @@ class Runtime:
         if mode == "mul":
             vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
         else:
-            unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
+            scale = self.adapter.mlp_scale(self.lm.layers[layer])
+            unit = self.layer_resid_p50(layer) / (scale * float(self.down_col(layer, n).norm()))
             vals = [r * dose * unit for r in rows]
         return (layer, n, mode, torch.tensor(vals, device=self.dev))
 
@@ -252,6 +284,7 @@ class Runtime:
         scale 0 = ablated. Only earlier layers can move the read (a same-layer MLP push lands after the capture; a
         same-layer head change lands before it)."""
         self.ensure_loaded()
+        norm_heads = self._validate_heads(heads)
         with self.lock:
             if chat:
                 ids = self.chat_ids(text)
@@ -259,7 +292,7 @@ class Runtime:
                 ids = self.tok(text).input_ids
             self._read = (layer, n)
             self._push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
-            self._heads = list(heads) or None if heads else None
+            self._heads = norm_heads
             try:
                 with torch.inference_mode():
                     self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
@@ -279,6 +312,7 @@ class Runtime:
         reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
         the same distribution under that intervention: (base, intervened or None)."""
         self.ensure_loaded()
+        norm_heads = self._validate_heads(heads)
         ids = self.chat_ids(text) if chat else self.tok(text).input_ids
         if prefix:
             ids = ids + self.tok(prefix, add_special_tokens=False).input_ids
@@ -297,16 +331,23 @@ class Runtime:
         if not pushes and not heads:
             return base, None
         push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
-        return base, run(push, list(heads) if heads else None)
+        return base, run(push, norm_heads)
 
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
         if self._con_idx is None:
-            path = os.path.join(CACHE, "connections.npz")
+            path = os.path.join(MODEL_CACHE, "connections.npz")
             if os.path.exists(path):
-                z = np.load(path)
-                self._con_idx = {key: z[key] for key in z.files}
-                self._con_idx["k"] = int(z["k"])
+                try:
+                    z = np.load(path)
+                    expected = (self.arch["n_layers"], self.arch["inter"])
+                    if z["down_z"].shape[:2] == expected and z["up_z"].shape[:2] == expected:
+                        self._con_idx = {key: z[key] for key in z.files}
+                        self._con_idx["k"] = int(z["k"])
+                    else:
+                        self._con_idx = False
+                except Exception:
+                    self._con_idx = False
             else:
                 self._con_idx = False
         return self._con_idx or None
@@ -314,16 +355,33 @@ class Runtime:
     # ---------- logit lens ----------
     def lens_index(self):
         if self._lens_idx is None:
-            path = os.path.join(CACHE, "lens_index.npz")
+            path = os.path.join(MODEL_CACHE, "lens_index.npz")
             if os.path.exists(path):
-                z = np.load(path)
-                self._lens_idx = {"up": z["up"], "down": z["down"]}
+                try:
+                    z = np.load(path)
+                    expected = (self.arch["n_layers"], self.arch["inter"])
+                    if z["up"].shape[:2] == expected and z["down"].shape[:2] == expected:
+                        self._lens_idx = {"up": z["up"], "down": z["down"]}
+                    else:
+                        self._lens_idx = None
+                except Exception:
+                    self._lens_idx = None
         return self._lens_idx
 
     def steer_index(self):
         if getattr(self, "_steer_idx", None) is None:
-            path = os.path.join(CACHE, "steer_index.npz")
-            self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
+            path = os.path.join(MODEL_CACHE, "steer_index.npz")
+            if os.path.exists(path):
+                try:
+                    z = np.load(path)
+                    if z["up"].shape[:2] == (self.arch["n_layers"], self.arch["inter"]):
+                        self._steer_idx = dict(z)
+                    else:
+                        self._steer_idx = False
+                except Exception:
+                    self._steer_idx = False
+            else:
+                self._steer_idx = False
         return self._steer_idx or None
 
     def lens(self, layer, n, k=16):
@@ -343,7 +401,7 @@ class Runtime:
             d = self.down_col(layer, n).to(self.model.dtype)[None, None]
             out = {}
             for sign, name in ((1, "up"), (-1, "down")):
-                logits = self.model.lm_head(self.lm.norm(sign * d))[0, 0].float()
+                logits = self.model.lm_head(self.adapter.final_norm()(sign * d))[0, 0].float()
                 top = logits.topk(k).indices.tolist()
                 out[name] = [self.tok.decode([t]) for t in top]
         self._lens_cache[(layer, n, k)] = out
@@ -389,20 +447,22 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
-            me = self.lm.layers[layer]
-            scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
-            r_g = me.mlp.gate_proj.weight[n] * scale_me
-            r_u = me.mlp.up_proj.weight[n] * scale_me
+            d = self.down_col(layer, n).to(dt)
+            me_l = self.lm.layers[layer]
+            scale_me = self.adapter.pre_mlp_norm_scale(me_l).to(dt)
+            g_w, u_w = self.adapter.gate_up_weights(me_l)
+            r_g = g_w[n].to(dt) * scale_me
+            r_u = u_w[n].to(dt) * scale_me
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
-                    v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
-                    g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
+                    v = d * self.adapter.pre_mlp_norm_scale(Lyr).to(dt)
+                    gj_w, uj_w = self.adapter.gate_up_weights(Lyr)
+                    g, u = (gj_w.to(dt) @ v).float(), (uj_w.to(dt) @ v).float()
                     side = "down"
                 else:
-                    W = Lyr.mlp.down_proj.weight
+                    W = self.adapter.down_proj(Lyr).weight.to(dt)
                     g, u = (r_g @ W).float(), (r_u @ W).float()
                     side = "up"
                 prod = g * u
@@ -421,8 +481,8 @@ class Runtime:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
             elif every and lens_k:
-                D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
-                logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
+                D = torch.stack([self.adapter.down_proj(self.lm.layers[c["layer"]]).weight[:, c["n"]] for c in every])
+                logits = self.model.lm_head(self.adapter.final_norm()(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
                     c["lens"] = [self.tok.decode([t]) for t in row]
@@ -436,36 +496,115 @@ class Runtime:
         return out
 
     # ---------- logit-lens index over every neuron ----------
-    def build_lens_index(self, path, k=12, chunk=1024):
+    def build_lens_index(self, path, k=12, chunk=1024, layers=None):
         """Top-k tokens each neuron's down column pushes up and down, for every layer. Saved as int32 arrays
         up[L, N, k], down[L, N, k]."""
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        all_layers = self.adapter.layers()
+        L, N = len(all_layers), self.adapter.down_proj(all_layers[0]).in_features
         up = np.zeros((L, N, k), np.int32)
         down = np.zeros((L, N, k), np.int32)
-        for li, layer in enumerate(self.lm.layers):
+        eval_layers = range(L) if layers is None else layers
+        for li in eval_layers:
             self.status = f"indexing lens {li}/{L}"
+            layer = all_layers[li]
             with self.lock, torch.inference_mode():
-                W = layer.mlp.down_proj.weight  # [hidden, inter]
+                W = self.adapter.down_proj(layer).weight  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
-                    logits = self.model.lm_head(self.lm.norm(D))[:, 0]
+                    logits = self.model.lm_head(self.adapter.final_norm()(D))[:, 0]
                     up[li, s:s + chunk] = logits.topk(k).indices.cpu().numpy()
                     down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez(path, up=up, down=down)
+        self.status = "ready"
+        return path
+    # ---------- in-process direct-path top-k connections ----------
+    def build_connections_index(self, path, k=24, layers=None):
+        """Direct-path top-k upstream and downstream links for every neuron across all layer pairs."""
+        self.ensure_loaded()
+        all_layers = self.adapter.layers()
+        L = len(all_layers)
+        N = self.adapter.down_proj(all_layers[0]).in_features
+        dev = self.dev
+        best = {
+            s: (
+                torch.full((L, N, k), -1e9, device=dev),
+                torch.zeros((L, N, k), dtype=torch.int16, device=dev),
+                torch.zeros((L, N, k), dtype=torch.int16, device=dev),
+                torch.zeros((L, N, k), dtype=torch.int8, device=dev),
+            )
+            for s in ("down", "up")
+        }
+
+        def merge(side, l, z, idx, other_layer, sign):
+            bz, bl, bn, bs = best[side]
+            cz = torch.cat([bz[l], z], 1)
+            cl = torch.cat([bl[l], torch.full_like(idx, other_layer, dtype=torch.int16)], 1)
+            cn = torch.cat([bn[l], idx.to(torch.int16)], 1)
+            cs = torch.cat([bs[l], sign], 1)
+            top = cz.topk(k, dim=1)
+            bz[l], bl[l], bn[l], bs[l] = top.values, cl.gather(1, top.indices), cn.gather(1, top.indices), cs.gather(1, top.indices)
+
+        eval_layers = list(range(L)) if layers is None else list(layers)
+        down = {l: self.adapter.down_proj(all_layers[l]).weight.to(dev, torch.bfloat16) for l in eval_layers}
+        gates = {l: self.adapter.gate_up_weights(all_layers[l])[0].to(dev, torch.bfloat16) for l in eval_layers}
+        ups = {l: self.adapter.gate_up_weights(all_layers[l])[1].to(dev, torch.bfloat16) for l in eval_layers}
+        norm = {l: self.adapter.pre_mlp_norm_scale(all_layers[l]).to(dev, torch.bfloat16) for l in eval_layers}
+
+        with torch.inference_mode():
+            for idx_j, j in enumerate(eval_layers[1:], 1):
+                self.status = f"indexing connections {j}/{L}"
+                for i in eval_layers[:idx_j]:
+                    V = down[i] * norm[j][:, None]
+                    P = (gates[j] @ V).float() * (ups[j] @ V).float()
+                    M = P.abs()
+                    # downstream of A (layer i): column A over B
+                    zc = (M - M.mean(0, keepdim=True)) / (M.std(0, keepdim=True) + 1e-8)
+                    top = zc.topk(k, dim=0)
+                    sgn = torch.where(P.gather(0, top.indices) > 0, 1, -1).to(torch.int8)
+                    merge("down", i, top.values.T, top.indices.T, j, sgn.T)
+                    # upstream of B (layer j): row B over A
+                    zr = (M - M.mean(1, keepdim=True)) / (M.std(1, keepdim=True) + 1e-8)
+                    top = zr.topk(k, dim=1)
+                    sgn = torch.where(P.gather(1, top.indices) > 0, 1, -1).to(torch.int8)
+                    merge("up", j, top.values, top.indices, i, sgn)
+                    del P, M, zc, zr
+
+        out = {}
+        for side, (bz, bl, bn, bs) in best.items():
+            out[f"{side}_z"] = bz.clamp(min=-60000).cpu().numpy().astype(np.float16)
+            out[f"{side}_layer"] = bl.cpu().numpy().astype(np.int8)
+            out[f"{side}_n"] = bn.cpu().numpy()
+            out[f"{side}_sign"] = bs.cpu().numpy()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, **out, k=k)
         self.status = "ready"
         return path
 
     def vocab_strings(self):
         if getattr(self, "_vocab", None) is None:
-            path = os.path.join(CACHE, "vocab.json")
+            path = os.path.join(MODEL_CACHE, "vocab.json")
             if os.path.exists(path):
-                self._vocab = json.load(open(path))
-            else:
+                try:
+                    with open(path) as f:
+                        v = json.load(f)
+                    if len(v) == self.arch["vocab_size"]:
+                        self._vocab = v
+                except Exception:
+                    pass
+            if getattr(self, "_vocab", None) is None:
                 if self.tok is None:
                     self.tok = AutoTokenizer.from_pretrained(MODEL)
-                self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
-                json.dump(self._vocab, open(path, "w"))
+                n_tok = len(self.tok)
+                self._vocab = [self.tok.decode([i]) for i in range(n_tok)]
+                if len(self._vocab) < self.arch["vocab_size"]:
+                    self._vocab.extend([f"<|extra_{i}|>" for i in range(len(self._vocab), self.arch["vocab_size"])])
+                elif len(self._vocab) > self.arch["vocab_size"]:
+                    self._vocab = self._vocab[:self.arch["vocab_size"]]
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump(self._vocab, f)
         return self._vocab
 
     # ---------- which neurons fire on a text ----------
@@ -486,7 +625,7 @@ class Runtime:
         """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
         from datasets import load_dataset
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
+        L, N = len(self.lm.layers), self.adapter.down_proj(self.lm.layers[0]).in_features
         pos, neg = np.zeros((L, N), np.float32), np.zeros((L, N), np.float32)
         buf, seen = [], 0
         for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):
@@ -500,6 +639,7 @@ class Runtime:
                 seen += seq
             if seen >= tokens:
                 break
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez(path, pos=pos, neg=neg, tokens=seen)
         self.status = "ready"
         return path

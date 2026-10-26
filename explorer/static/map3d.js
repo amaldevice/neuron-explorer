@@ -103,18 +103,19 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const x = layerX(l), mx = x + MLP_DX, ax = x + ATTN_DX, cs = sheetCorners(mx);
     for (let i = 0; i < 4; i++) seg(cs[i], cs[(i + 1) % 4]);
     seg(V(ax, 0, 0), V(ax, SHEET_Y0, 0)); seg(V(mx, 0, 0), V(mx, SHEET_Y0, 0));
-    const full = arch.layer_types[l] === "full_attention", t = full ? 0.3 : 0.1;
+    const mixer = arch.layer_types[l];
+    const full = mixer === "full_attention", t = full ? 0.3 : 0.1;
     const slab = new THREE.Mesh(new THREE.BoxGeometry(t, SHEET * 0.92, SHEET * 0.92), new THREE.MeshBasicMaterial({
       color: full ? 0x8fa6b2 : 0x6f8590, transparent: true, opacity: (full ? 0.075 : 0.045) * BRIGHT, depthWrite: false }));
     slab.position.set(ax, SHEET_Y0 + SHEET / 2, 0);
-    slab.userData = { layer: l, full };
+    slab.userData = { layer: l, full, mixer };
     scene.add(slab); slabs.push(slab);
     const edges = new THREE.LineSegments(new THREE.EdgesGeometry(slab.geometry),
       new THREE.LineBasicMaterial({ color: full ? PAL.slabEdgeFull : PAL.slabEdge, transparent: true }));
     edges.position.copy(slab.position); scene.add(edges);
     slab.userData.edges = edges; slab.userData.baseOpacity = slab.material.opacity;
-    const heads = full ? arch.attn_heads : arch.linear_v_heads;
-    for (let h = 0; h < heads; h++) {
+    const heads = full ? arch.attn_heads : (mixer === "linear_attention" ? arch.linear_v_heads : 0);
+    for (let h = 0; h < (heads || 0); h++) {
       const z = ((h + 0.5) / heads - 0.5) * SHEET * 0.82;
       (full ? headPos.full : headPos.lin).push(ax + t / 2 + 0.003, SHEET_Y0 + 0.35, z, ax + t / 2 + 0.003, SHEET_Y0 + SHEET - 0.35, z);
     }

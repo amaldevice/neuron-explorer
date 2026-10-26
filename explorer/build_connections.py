@@ -13,6 +13,7 @@ Writes explorer/cache/connections.npz: {down,up}_layer [L, N, k] int8, {down,up}
 import argparse
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -21,29 +22,79 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+ap.add_argument("--model", default="LiquidAI/LFM2.5-350M")
 ap.add_argument("--k", type=int, default=24)
-ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "connections.npz"))
+ap.add_argument("--out", default=None)
+ap.add_argument("--layers", type=int, default=None)
 a = ap.parse_args()
-dev = "cuda" if torch.cuda.is_available() else "mps"
+dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
-root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
-index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
-L, N, K = cfg["num_hidden_layers"], cfg["intermediate_size"], a.k
+def model_slug(model_id):
+    return model_id.lower().replace("/", "--")
 
+try:
+    root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
+except Exception:
+    root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"], local_files_only=True)
 
-def tensor(name):
-    with safe_open(os.path.join(root, index[name]), "pt") as f:
-        return f.get_tensor(name).to(dev, torch.bfloat16)
+index_path = os.path.join(root, "model.safetensors.index.json")
+if os.path.exists(index_path):
+    index = json.load(open(index_path))["weight_map"]
+    def tensor(name):
+        with safe_open(os.path.join(root, index[name]), "pt") as f:
+            return f.get_tensor(name).to(dev, torch.bfloat16)
+    keys = set(index.keys())
+else:
+    st_file = os.path.join(root, "model.safetensors")
+    def tensor(name):
+        with safe_open(st_file, "pt") as f:
+            return f.get_tensor(name).to(dev, torch.bfloat16)
+    with safe_open(st_file, "pt") as f:
+        keys = set(f.keys())
 
+DOWN_RE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.(?:mlp\.down_proj|feed_forward\.w2|shared_mlp\.output_linear)\.weight$"
+)
+down_keys = {int(m.group(1)): k for k in keys if (m := DOWN_RE.match(k))}
+total_L = len(down_keys)
+L = min(total_L, a.layers) if a.layers is not None else total_L
 
-pre = "model.language_model.layers.{}."
-down = [tensor(pre.format(l) + "mlp.down_proj.weight") for l in range(L)]
-gate = [tensor(pre.format(l) + "mlp.gate_proj.weight") for l in range(L)]
-up = [tensor(pre.format(l) + "mlp.up_proj.weight") for l in range(L)]
-norm = [(1.0 + tensor(pre.format(l) + "post_attention_layernorm.weight").float()).to(torch.bfloat16) for l in range(L)]
+down, gate, up, norm = [], [], [], []
+for l in range(L):
+    down_k = down_keys[l]
+    d_t = tensor(down_k)
+    down.append(d_t)
+    prefix = down_k.rsplit(".", 2)[0] + "."
+    if prefix + "w1.weight" in keys:
+        g_t = tensor(prefix + "w1.weight")
+        u_t = tensor(prefix + "w3.weight")
+    elif prefix + "gate_proj.weight" in keys:
+        g_t = tensor(prefix + "gate_proj.weight")
+        u_t = tensor(prefix + "up_proj.weight")
+    elif prefix.endswith(".shared_mlp.") and (prefix + "input_linear.weight") in keys:
+        fused = tensor(prefix + "input_linear.weight")
+        N_l = d_t.shape[1]
+        g_t, u_t = fused[:N_l], fused[N_l:]
+    else:
+        raise KeyError(f"Missing gate/up weights for layer {l}")
+    gate.append(g_t)
+    up.append(u_t)
 
+    norm_k_lfm = f"model.layers.{l}.ffn_norm.weight"
+    norm_k_qwen_cond = f"model.language_model.layers.{l}.post_attention_layernorm.weight"
+    norm_k_causal = f"model.layers.{l}.post_attention_layernorm.weight"
+    if norm_k_lfm in keys:
+        norm.append(tensor(norm_k_lfm).float().to(torch.bfloat16))
+    elif norm_k_qwen_cond in keys or (norm_k_causal in keys and "mlp.down_proj.weight" in down_k):
+        nk = norm_k_qwen_cond if norm_k_qwen_cond in keys else norm_k_causal
+        norm.append((1.0 + tensor(nk).float()).to(torch.bfloat16))
+    elif norm_k_causal in keys:
+        norm.append(tensor(norm_k_causal).float().to(torch.bfloat16))
+    else:
+        raise KeyError(f"Missing norm weight for layer {l}")
+
+N = down[0].shape[1]
+K = a.k
 # running top-k per neuron and side: score, source layer, source neuron, sign
 best = {s: (torch.full((L, N, K), -1e9, device=dev), torch.zeros((L, N, K), dtype=torch.int16, device=dev),
             torch.zeros((L, N, K), dtype=torch.int16, device=dev), torch.zeros((L, N, K), dtype=torch.int8, device=dev))
@@ -86,5 +137,7 @@ for side, (bz, bl, bn, bs) in best.items():
     out[f"{side}_layer"] = bl.cpu().numpy().astype(np.int8)
     out[f"{side}_n"] = bn.cpu().numpy()
     out[f"{side}_sign"] = bs.cpu().numpy()
-np.savez_compressed(a.out, **out, k=K)
-print("->", a.out, f"{os.path.getsize(a.out) / 1e6:.0f} MB")
+out_path = a.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", model_slug(a.model), "connections.npz")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+np.savez_compressed(out_path, **out, k=K)
+print("->", out_path, f"{os.path.getsize(out_path) / 1e6:.0f} MB")

@@ -15,29 +15,32 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import NO_MODEL, Runtime  # noqa: E402
+from runtime import NO_MODEL, Runtime, MODEL, MODEL_CACHE  # noqa: E402
+from models import arch_from_model_or_config  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
+NAMES = os.path.join(MODEL_CACHE, "names.json")
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
-        "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
-        "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
-        "linear_v_heads": _cfg.linear_num_value_heads}
+ARCH = arch_from_model_or_config(MODEL)
 
 app = FastAPI()
 
 
+@app.exception_handler(RuntimeError)
+async def oom_handler(request: Request, exc: RuntimeError):
+    if "out of memory" in str(exc).lower():
+        return JSONResponse({"error": "Out of memory"}, status_code=503)
+    raise exc
+
+
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
 # the API, which runs the model and a Claude agent with a shell
-LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
+LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}", "testserver"}
 
 
 @app.middleware("http")
@@ -68,6 +71,8 @@ def layer_runs():
     for meta_path in glob.glob(os.path.join(RUNS, "*.meta.json")):
         meta = json.load(open(meta_path))
         if meta.get("design_name", "main") == "calib":
+            continue
+        if meta.get("model") != MODEL:
             continue
         jsonl = meta_path.replace(".meta.json", ".jsonl")
         if not os.path.exists(jsonl):
@@ -139,13 +144,18 @@ def swept(layer):
 
 
 def names():
-    return json.load(open(NAMES)) if os.path.exists(NAMES) else {}
+    if os.path.exists(NAMES):
+        return json.load(open(NAMES))
+    legacy = os.path.join(ROOT, "explorer", "names.json")
+    if os.path.exists(legacy) and MODEL == "Qwen/Qwen3.5-4B":
+        return json.load(open(legacy))
+    return {}
 
 
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL, "arch": ARCH, "agent": get_agent_name(),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -153,17 +163,35 @@ def index():
 def units(layer: int):
     d = load_layer(layer)
     if d is None:
+        st = rt.steer_index()
+        if st is not None and "up_kl" in st and "down_kl" in st and 0 <= layer < len(st["up_kl"]):
+            max_kl = np.maximum(st["up_kl"][layer], st["down_kl"][layer])
+            if np.any(max_kl > 0) or np.any(st.get("up", [])[layer] != 0) or np.any(st.get("down", [])[layer] != 0):
+                sorted_indices = np.argsort(-max_kl)
+                nm = names()
+                v = rt.vocab_strings()
+                return [
+                    {
+                        "n": int(n),
+                        "kind": "neuron",
+                        "z": float(max_kl[n]),
+                        "metric": "kl",
+                        "words": [v[int(t)] for t in (st["up"] if st["up_kl"][layer, n] >= st["down_kl"][layer, n] else st["down"])[layer, n, :5]],
+                        "name": nm.get(f"L{layer}/N{n}", ""),
+                    }
+                    for n in sorted_indices
+                ]
         return []
     nm = names()
     return [{"kind": u["kind"], "n": u["neuron"], "z": u.get("mass", u["z"]), "null_pct": u["null_pct"],
              "words": [w for w, _, _ in u["words"][:5]], "name": nm.get(f"L{layer}/N{u['neuron']}", "")}
             for u in d["units"]]
 
-
 @app.get("/api/unit")
 def unit(layer: int, n: int, kind: str = "neuron"):
     d = load_layer(layer)
-    out = {"layer": layer, "n": n, "kind": kind, "name": names().get(f"L{layer}/N{n}", "")}
+    out = {"layer": layer, "n": n, "kind": kind, "name": names().get(f"L{layer}/N{n}", ""),
+           "act_range": act_range(layer, n)}
     if d is None:
         return out
     rec = next((u for u in d["units"] if u["neuron"] == n and u["kind"] == kind), None)
@@ -190,6 +218,7 @@ async def set_name(req: Request):
         nm[key] = body["name"].strip()
     else:
         nm.pop(key, None)
+    os.makedirs(os.path.dirname(NAMES), exist_ok=True)
     with open(NAMES, "w") as f:
         json.dump(nm, f, indent=1, sort_keys=True)
     return {"ok": True}
@@ -232,7 +261,9 @@ async def hover(layer: int, n: int):
 
 @app.get("/api/lens")
 async def lens(layer: int, n: int):
-    return await asyncio.to_thread(rt.lens, layer, n, 12)
+    out = await asyncio.to_thread(rt.lens, layer, n, 12)
+    out["act_range"] = act_range(layer, n)
+    return out
 
 
 @app.post("/api/reads")
@@ -256,10 +287,13 @@ async def steer(req: Request):
                     msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
                 rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
             for row, delta in rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
-                                              b.get("mode", "add"), int(b.get("max_new", 300)), cancel):
+                                              b.get("mode", "add"), int(b.get("max_new", 150)), cancel):
                 loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
         except Exception as e:  # surfaced in the UI next to the chat
-            loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
+            if "out of memory" in str(e).lower():
+                loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": "Out of memory"})
+            else:
+                loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -279,14 +313,18 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
+LENS_INDEX = os.path.join(MODEL_CACHE, "lens_index.npz")
 _lens = {}
 
 
 def lens_index():
     if "up" not in _lens and os.path.exists(LENS_INDEX):
-        z = np.load(LENS_INDEX)
-        _lens["up"], _lens["down"] = z["up"], z["down"]
+        try:
+            z = np.load(LENS_INDEX)
+            if z["up"].shape[:2] == (ARCH["n_layers"], ARCH["inter"]):
+                _lens["up"], _lens["down"] = z["up"], z["down"]
+        except Exception:
+            pass
     return _lens if "up" in _lens else None
 
 
@@ -327,7 +365,7 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
+ACT_SCALE = os.path.join(MODEL_CACHE, "act_scale.npz")
 MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
 
 
@@ -338,7 +376,11 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     if not os.path.exists(ACT_SCALE):
         return {"ready": False, "results": []}
     sc = np.load(ACT_SCALE)
-    ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
+    if sc["pos"].shape[:2] != (ARCH["n_layers"], ARCH["inter"]):
+        return {"ready": False, "results": []}
+    full_ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
+    truncated = len(full_ids) > MAX_INFER_TOKENS
+    ids = full_ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.all_activations, ids)
     toks = [rt.tok.decode([t]) for t in ids]
     cand = []
@@ -356,7 +398,7 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
         lens = [vocab[k] for k in (idx_lens["up"] if sign == "+" else idx_lens["down"])[l, n, :6]] if idx_lens else []
         res.append({"layer": l, "n": n, "sign": sign, "score": round(score, 2), "act": round(raw, 2), "token": toks[t],
                     "pos": t, "name": nm.get(f"L{l}/N{n}", ""), "lens": lens})
-    return {"ready": True, "results": res, "tokens": toks}
+    return {"ready": True, "results": res, "tokens": toks, "truncated": truncated, "total_tokens": len(full_ids)}
 
 
 _infer = {}
@@ -384,13 +426,16 @@ async def infer(req: Request):
     b = await req.json()
     if not os.path.exists(ACT_SCALE) or rt.tok is None:
         return {"ready": False}
+    full_ids = rt.chat_ids(b["text"]) if b.get("chat", False) else rt.tok(b["text"]).input_ids
+    truncated = len(full_ids) > MAX_INFER_TOKENS
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
     units = rt.token_units(ids)
     unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
     _infer.clear()
     _infer.update(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score)
     # one chip per unit; clicking it selects the unit's last token (the one that completes the character)
-    return {"ready": True, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
+    return {"ready": True, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
+            "truncated": truncated, "total_tokens": len(full_ids)}
 
 
 @app.get("/api/infer/view")
@@ -453,15 +498,16 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
     rows = []
-    for l, n in active:
-        for i in range(ci["k"]):
-            z = float(ci["down_z"][l, n, i])
-            if z < -1e4:
-                break
-            t = (int(ci["down_layer"][l, n, i]), int(ci["down_n"][l, n, i]))
-            if t in active:
-                push = int(ci["down_sign"][l, n, i]) * (1 if S[l, n] > 0 else -1)
-                rows.append((l, n, *t, round(z * 10) * push, 1))
+    if ci:
+        for l, n in active:
+            for i in range(ci["k"]):
+                z = float(ci["down_z"][l, n, i])
+                if z < -1e4:
+                    break
+                t = (int(ci["down_layer"][l, n, i]), int(ci["down_n"][l, n, i]))
+                if t in active:
+                    push = int(ci["down_sign"][l, n, i]) * (1 if S[l, n] > 0 else -1)
+                    rows.append((l, n, *t, round(z * 10) * push, 1))
     out = np.array(rows, np.int16).reshape(-1, 6)
     return Response(out.tobytes(), media_type="application/octet-stream",
                     headers={"X-Web-Total": str(len(out)), "X-Active": str(len(active))})
@@ -471,7 +517,7 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
 def layout(kind: str = "writes"):
     """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    path = os.path.join(MODEL_CACHE, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
     cell = np.load(path)["cell"].astype(np.int16)
@@ -484,6 +530,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     neuron's top `first` links (all when None), later hops each node's top k with z >= zmin, up to `hops` hops; each side keeps at most cap / 2 links.
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
+    if not ci:
+        return []
     out = []
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
@@ -529,6 +577,8 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     `held_by` (the pole that inhibits it)."""
     st = rt.steer_index() if src == "steer" else None
     lens = st if st is not None else rt.lens_index()
+    if lens is None:
+        return {"src": src, "links": 0, "down": {"neurons": 0, "toward": [], "away": []}, "up": {"neurons": 0, "fed_by": [], "held_by": []}}
     v = rt.vocab_strings()
     key_src = "steer" if st is not None else "logit"
     if _idf.get("src") != key_src:
@@ -581,15 +631,39 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 # Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # the agent CLI's cwd, so no project settings or CLAUDE.md apply
 _chats = {}
 _act = {}
 
 
+def get_agent_name():
+    """Which Agent CLI this server talks to: EXPLORER_AGENT, else the first of omp, pi, claude on PATH."""
+    import shutil
+    want = (os.environ.get("EXPLORER_AGENT") or "").strip().lower()
+    if want in ("omp", "pi", "claude"):
+        return want
+    for b in ("omp", "pi", "claude"):
+        if shutil.which(b):
+            return b
+    return "claude"
+
+
+def get_agent_model():
+    """The model the agent CLI should use: EXPLORER_AGENT_MODEL, else the older EXPLORER_CLAUDE_MODEL."""
+    return os.environ.get("EXPLORER_AGENT_MODEL") or os.environ.get("EXPLORER_CLAUDE_MODEL") or ""
+
+
+AGENT_NAME = get_agent_name()
+
+
 def act_range(layer, n):
     if "pos" not in _act and os.path.exists(ACT_SCALE):
-        z = np.load(ACT_SCALE)
-        _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]))
+        try:
+            z = np.load(ACT_SCALE)
+            if z["pos"].shape[:2] == (ARCH["n_layers"], ARCH["inter"]):
+                _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]))
+        except Exception:
+            pass
     if "pos" not in _act:
         return None
     return {"act_max": round(float(_act["pos"][layer, n]), 3), "act_min": round(float(_act["neg"][layer, n]), 3),
@@ -599,8 +673,8 @@ def act_range(layer, n):
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
-            "named_neurons": len(names()), "live_model": not NO_MODEL}
+    return {"model": MODEL, "arch": ARCH, "layers_with_sweeps": sorted(runs),
+            "named_neurons": len(names()), "live_model": not NO_MODEL, "agent": get_agent_name()}
 
 
 @app.get("/api/agent/names")
@@ -645,7 +719,7 @@ def agent_cone(layer: int, n: int, k: int = 2, limit: int = 120):
     return {"links": len(links), "neurons": len(best), "per_hop": dict(sorted(per_hop.items())),
             "note": "weight-only direct-path links chained; paths past hop 1 are leads, not circuits",
             "nodes": [{"neuron": f"L{l} N{m}", "hop": hop, "z": round(abs(z), 1), "sign": 1 if z > 0 else -1,
-                       "steer_up": [v[t] for t in idx["up"][l, m, :5]], "name": nm.get(f"L{l}/N{m}") or None}
+                       "steer_up": [v[t] for t in idx["up"][l, m, :5]] if idx else [], "name": nm.get(f"L{l}/N{m}") or None}
                       for (l, m), (z, hop) in nodes]}
 
 
@@ -809,7 +883,7 @@ async def agent_fires(req: Request):
         sg = "+" if S[l, n] > 0 else "-"
         res.append({"neuron": f"L{l} N{n}", "pole": sg, "score": round(float(abs(S[l, n])), 2),
                     "act": round(float(acts[l, pos, n]), 3), "name": nm.get(f"L{l}/N{n}") or None,
-                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]]})
+                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]] if st else []})
     return {"tokens": toks, "at": pos, "token": toks[pos],
             "note": "score = activation / the neuron's typical extreme on that side; 1 = as strong as its usual max",
             "neurons": res}
@@ -821,7 +895,7 @@ async def agent_ui(req: Request):
     c = _chats.get(b.pop("chat", ""))
     if c is None:
         return {"ok": False, "error": "no such chat"}
-    c["queue"].put_nowait(("ui", b))
+    c["events"].put_nowait({"t": "ui", **b})
     return {"ok": True, "note": "shown in the explorer"}
 
 
@@ -904,16 +978,93 @@ async def _stop_turn(proc):
             pass
 
 
+@app.post("/api/agent/cancel")
+async def agent_cancel(req: Request):
+    b = await req.json()
+    c = _chats.get(b.get("chat", ""))
+    if c and c.get("proc"):
+        await _stop_turn(c["proc"])
+        return {"ok": True}
+    return {"ok": False}
+def _write_if_changed(path, text):
+    if not os.path.exists(path) or open(path).read() != text:
+        with open(path, "w") as f:
+            f.write(text)
+    return path
+
+
+def _mcp_server_entry():
+    """The explorer MCP server, as both agent CLIs want it: stdio, with the per-chat env expanded at launch."""
+    return {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
+            "env": {"EXPLORER_URL": "${EXPLORER_URL}", "EXPLORER_CHAT": "${EXPLORER_CHAT}"}}
+
+
+def _setup_omp():
+    """omp's project config under AGENT_DIR: the explorer MCP server, and no context files or foreign tools."""
+    d = os.path.join(AGENT_DIR, ".omp")
+    os.makedirs(d, exist_ok=True)
+    _write_if_changed(os.path.join(d, "mcp.json"),
+                      json.dumps({"mcpServers": {"explorer": {"type": "stdio", **_mcp_server_entry()}}}, indent=1))
+    cfg = ("tools:\n  xdev: false\n  intentTracing: false\n"
+           "includeWorkspaceTree: false\n"
+           "disabledProviders:\n"
+           "  - claude\n  - claude-plugins\n  - codex\n  - gemini\n  - opencode\n"
+           "  - cursor\n  - windsurf\n  - cline\n  - github\n  - vscode\n  - agents\n"
+           "  - agents-md\n  - claude-md\n  - custom-context\n"
+           "disabledExtensions:\n"
+           "  - context-file:user:AGENTS.md\n  - context-file:user:CLAUDE.md\n"
+           "  - context-file:project:AGENTS.md\n  - context-file:project:CLAUDE.md\n"
+           "  - context-file:user:GEMINI.md\n  - context-file:project:GEMINI.md\n"
+           "  - context-file:user:copilot-instructions.md\n  - context-file:project:copilot-instructions.md\n"
+           "contextFiles:\n  extra: []\n")
+    _write_if_changed(os.path.join(d, "config.yml"), cfg)
+
+
+def _setup_pi():
+    """pi's project config under AGENT_DIR: the explorer MCP server, exposed directly to the model."""
+    d = os.path.join(AGENT_DIR, ".pi")
+    os.makedirs(d, exist_ok=True)
+    _write_if_changed(os.path.join(d, "mcp.json"),
+                      json.dumps({"mcpServers": {"explorer": {"exposure": "direct", **_mcp_server_entry()}}}, indent=1))
+
+
+def _upload_path(fid):
+    """The absolute path of an uploaded file, or None if that id is gone."""
+    fid = os.path.basename(str(fid))
+    meta_path = os.path.join(UPLOADS, f"{fid}.json")
+    if not os.path.exists(meta_path):
+        return None
+    meta = json.load(open(meta_path))
+    p = os.path.join(UPLOADS, f"{fid}-{meta['name']}")
+    return os.path.abspath(p) if os.path.exists(p) else None
+
+
 def _session_file(sid):
-    hits = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), "*", f"{os.path.basename(sid)}.jsonl"))
+    """The chat's session file: claude's own, or the v3 JSONL that omp / pi keep under AGENT_DIR/sessions."""
+    base = os.path.basename(str(sid))
+    backend = get_agent_name()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    direct = os.path.join(sessions, f"{base}.jsonl")  # omp writes the session where we point it
+    if backend == "omp":
+        return direct if os.path.exists(direct) else None
+    if backend == "pi":
+        hits = sorted(glob.glob(os.path.join(sessions, f"*_{base}.jsonl")))  # pi names it <timestamp>_<id>.jsonl
+        return hits[-1] if hits else None
+    hits = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), "*", f"{base}.jsonl"))
     return hits[0] if hits else None
 
 
 def _user_text(m):
     """The text of a message the person sent (None for tool results and CLI-injected notes)."""
-    if m.get("type") != "user" or m.get("isMeta"):
+    if m.get("type") == "message":  # omp / pi v3 session entries
+        msg = m.get("message") or {}
+        if msg.get("role") != "user" or msg.get("attribution") not in (None, "user"):
+            return None
+        c = msg.get("content")
+    elif m.get("type") == "user" and not m.get("isMeta"):  # claude
+        c = (m.get("message") or {}).get("content")
+    else:
         return None
-    c = (m.get("message") or {}).get("content")
     if isinstance(c, str):
         return c
     if isinstance(c, list) and not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
@@ -924,9 +1075,9 @@ def _user_text(m):
 
 @app.post("/api/agent/rewind")
 async def agent_rewind(req: Request):
-    """Cut a chat's claude session back to just before the last message the person sent that ends with `text`
+    """Cut a chat's session back to just before the last message the person sent that ends with `text`
     (everything after it goes too: the reply, a refusal, CLI notes). The cut session is backed up beside it first.
-    No match (already cut) is not an error."""
+    No match (already cut) is not an error. Works for claude, omp and pi session files."""
     import shutil
     import time
     b = await req.json()
@@ -941,7 +1092,9 @@ async def agent_rewind(req: Request):
             t = _user_text(json.loads(lines[i]))
         except ValueError:
             continue
-        if t is not None and (not text or t.strip() == text or t.strip().endswith("\n\n" + text) or t.split("\n\n", 1)[-1].strip() == text):
+        if t is not None and (not text or t.strip() == text or t.strip().endswith("\n\n" + text)
+                              or t.strip().endswith("\n" + text) or t.split("\n\n", 1)[-1].strip() == text
+                              or text in t):
             at = i
             break
     if at is None:
@@ -956,13 +1109,77 @@ async def agent_rewind(req: Request):
     return {"ok": True, "cut": True}
 
 
+def _omp_cmd(cid, msg, atts):
+    """The omp command line: this chat's session file, our system prompt, the file tools, the attachments."""
+    _setup_omp()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    path = os.path.join(sessions, f"{os.path.basename(cid)}.jsonl")
+    if not os.path.exists(path):
+        # omp has no --session-id: it opens a pre-seeded v3 session file
+        _write_if_changed(path, json.dumps({"type": "session", "version": 3, "id": cid,
+                                            "timestamp": "1970-01-01T00:00:00.000Z", "cwd": AGENT_DIR}) + "\n")
+    cmd = ["omp", "-p", "--mode", "json", "--no-extensions", "--no-skills", "--no-rules", "--no-lsp", "--no-title",
+           "--system-prompt", agent_prompt_file(), "--tools", ",".join(FILE_TOOLS), "--resume", path]
+    if get_agent_model():
+        cmd += ["--model", get_agent_model()]
+    return cmd + [f"@{p}" for p in atts] + ["--", msg]
+
+
+def _pi_cmd(cid, msg, atts):
+    """The pi command line: this chat's session id, our system prompt, the file tools plus the explorer tools."""
+    _setup_pi()
+    sessions = os.path.join(AGENT_DIR, "sessions")
+    os.makedirs(sessions, exist_ok=True)
+    cmd = ["pi", "-p", "--mode", "json", "--approve", "--session-dir", sessions, "--session-id", os.path.basename(cid),
+           "-ne", "-e", "builtin:mcp", "--no-skills", "--no-prompt-templates", "--no-context-files",
+           "--system-prompt", agent_prompt_file(), "--tools", "read,find,grep,write,edit,bash,mcp__explorer__*"]
+    if get_agent_model():
+        cmd += ["--model", get_agent_model()]
+    # pi has no PDF block: it can only be told the path
+    pdfs = [p for p in atts if p.lower().endswith(".pdf")]
+    others = [p for p in atts if p not in pdfs]
+    if pdfs:
+        msg = msg + "".join(f"\n[Attached PDF: {p}]" for p in pdfs)
+    return cmd + [f"@{p}" for p in others] + ["--", msg]
+
+
+def _unified_events(m, state):
+    """One line of an omp / pi JSONL stream -> the browser's events. `state` carries the cost and the last
+    assistant message, so the turn can end with a cost and an error."""
+    t = m.get("type")
+    if t == "message_update":
+        ev = m.get("assistantMessageEvent") or {}
+        if ev.get("type") == "text_delta":
+            yield {"t": "text", "text": ev.get("delta") or ""}
+    elif t == "tool_execution_start":
+        name = (m.get("toolName") or "").removeprefix("mcp__explorer__").removeprefix("mcp__explorer_")
+        yield {"t": "tool", "id": m.get("toolCallId"), "input": m.get("args") or {}, "name": name}
+    elif t == "tool_execution_end":
+        res = m.get("result") or {}
+        out = "\n".join(x.get("text", "") for x in (res.get("content") or []) if isinstance(x, dict))
+        yield {"t": "tool_result", "id": m.get("toolCallId"), "error": bool(m.get("isError")),
+               "output": out[:1500] + (f" … ({len(out)} chars)" if len(out) > 1500 else "")}
+    elif t == "message_end" and (m.get("message") or {}).get("role") == "assistant":
+        msg = m["message"]
+        if msg.get("usage") is not None:
+            state["seen"] = True
+            state["cost"] += ((msg.get("usage").get("cost") or {}).get("total") or 0.0)
+        state["last"] = msg
+    elif t == "agent_end" and not m.get("willRetry") and m.get("isTerminal") is not False:
+        last = state.get("last") or {}
+        if last.get("stopReason") == "error":
+            yield {"t": "error", "error": str(last.get("errorMessage") or "agent error")[:600]}
+        yield {"t": "done", "cost": state["cost"] if state.get("seen") else None}
+        state["done"] = True
+
+
 @app.post("/api/agent/chat")
 async def agent_chat(req: Request):
     """One turn. Body: {chat?, message, layer?, n?, attachments?: [upload ids]}. Streams NDJSON events: chat, text,
-    tool, tool_result, ui, done, error."""
-    import uuid
+    tool_use, tool_result, error, done."""
     b = await req.json()
-    # the chat id is the claude session id, so a chat the browser kept survives server restarts (it resumes)
+    # the chat id is the agent session id, so a chat the browser kept survives server restarts (it resumes)
     cid = b.get("chat") or str(uuid.uuid4())
     c = _chats.setdefault(cid, {"session": cid})
     c["queue"] = q = asyncio.Queue()
@@ -970,36 +1187,48 @@ async def agent_chat(req: Request):
     if b.get("layer") is not None:
         msg = f"[The person has L{int(b['layer'])} N{int(b['n'])} open in the explorer.]\n\n{msg}"
     os.makedirs(AGENT_DIR, exist_ok=True)
-    mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
-                                       "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
-    content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
-    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-           "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
-           # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
-           "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
-           "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
-    if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
+    backend = get_agent_name()
+    atts = [p for p in (_upload_path(a) for a in b.get("attachments") or []) if p]
+    env = {**os.environ, "EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}
+    if backend == "omp":
+        cmd = _omp_cmd(cid, msg, atts)
+    elif backend == "pi":
+        cmd = _pi_cmd(cid, msg, atts)
+    else:
+        mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
+                                           "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
+        content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
+        cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+               "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
+               # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
+               "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
+               "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
+        if get_agent_model():
+            cmd += ["--model", get_agent_model()]
 
     async def events():
         # a turn that was interrupted may still be exiting; it holds the session until it does
         await _stop_turn(c.get("proc"))
-        # resume once the session exists on disk (any earlier turn, finished or interrupted, creates it)
-        sess = ["--resume", c["session"]] if _session_file(c["session"]) else ["--session-id", c["session"]]
+        # claude resumes once the session exists on disk (any earlier turn, finished or interrupted, creates it)
+        sess = ["--resume", c["session"]] if (backend == "claude" and _session_file(c["session"])) else (
+            ["--session-id", c["session"]] if backend == "claude" else [])
         # its own process group, so stopping a turn also stops what it started (MCP server, shell scripts)
-        proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, *sess, cwd=AGENT_DIR, stdin=asyncio.subprocess.PIPE,
+        proc = c["proc"] = await asyncio.create_subprocess_exec(*cmd, *sess, cwd=AGENT_DIR,
+                                                    stdin=asyncio.subprocess.PIPE if backend == "claude" else asyncio.subprocess.DEVNULL,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                    limit=1 << 24, start_new_session=True)
-        proc.stdin.write((json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
+                                                    env=env, limit=1 << 24, start_new_session=True)
+        if backend == "claude":
+            proc.stdin.write((json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
 
         async def pump():
             async for line in proc.stdout:
-                q.put_nowait(("claude", line))
+                q.put_nowait(("line", line))
             q.put_nowait(("end", (await proc.stderr.read()).decode(errors="replace")))
         task = asyncio.create_task(pump())
         yield json.dumps({"t": "chat", "chat": cid}) + "\n"
+        state = {"cost": 0.0, "last": None, "done": False, "seen": False}
         try:
             while True:
                 kind, item = await q.get()
@@ -1007,22 +1236,35 @@ async def agent_chat(req: Request):
                     yield json.dumps({"t": "ui", **item}) + "\n"
                     continue
                 if kind == "end":
-                    if await proc.wait() != 0:
-                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"claude exited {proc.returncode}"}) + "\n"
+                    rc = await proc.wait()
+                    if rc != 0 and not state["done"]:
+                        yield json.dumps({"t": "error", "error": item.strip()[-600:] or f"{backend} exited {rc}"}) + "\n"
+                    if not state["done"]:
+                        yield json.dumps({"t": "done", "cost": state["cost"] if state["seen"] else None}) + "\n"
                     break
+                if kind == "stderr":
+                    # non-fatal diagnostics on stderr: surface only if they look like errors
+                    if "error" in item.lower():
+                        yield json.dumps({"t": "stderr", "text": item[:400]}) + "\n"
+                    continue
                 try:
                     m = json.loads(item)
                 except ValueError:
                     continue
+                if backend != "claude":
+                    for ev in _unified_events(m, state):
+                        yield json.dumps(ev) + "\n"
+                    continue
                 if m.get("type") == "stream_event":
-                    e = m["event"]
-                    if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
-                        yield json.dumps({"t": "text", "text": e["delta"]["text"]}) + "\n"
-                elif m.get("type") == "assistant":
-                    for blk in m["message"].get("content", []):
-                        if blk.get("type") == "tool_use":
-                            yield json.dumps({"t": "tool", "id": blk.get("id"), "input": blk.get("input"),
-                                              "name": blk["name"].removeprefix("mcp__explorer__")}) + "\n"
+                    ev = m.get("event") or {}
+                    if ev.get("type") == "content_block_delta":
+                        d = ev.get("delta") or {}
+                        if d.get("type") == "text_delta":
+                            yield json.dumps({"t": "text", "text": d.get("text", "")}) + "\n"
+                    elif ev.get("type") == "content_block_start":
+                        cb = ev.get("content_block") or {}
+                        if cb.get("type") == "tool_use":
+                            yield json.dumps({"t": "tool_start", "id": cb.get("id"), "name": cb.get("name")}) + "\n"
                 elif m.get("type") == "user":
                     for blk in (m.get("message") or {}).get("content") or []:
                         if isinstance(blk, dict) and blk.get("type") == "tool_result":
@@ -1054,6 +1296,7 @@ def status():
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
 
+
 @app.on_event("startup")
 def preload():
     def go():
@@ -1061,13 +1304,25 @@ def preload():
             rt.status = "no model"
             rt.vocab_strings()
             return
-        rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
-            os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
-            rt.build_lens_index(LENS_INDEX)
-        rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
-            rt.build_act_scale(ACT_SCALE)
+        try:
+            rt.ensure_loaded()
+            rt.vocab_strings()
+            if not os.path.exists(LENS_INDEX) or rt.lens_index() is None:
+                os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
+                rt.build_lens_index(LENS_INDEX)
+            con_path = os.path.join(MODEL_CACHE, "connections.npz")
+            if not os.path.exists(con_path) or rt.con_index() is None:
+                os.makedirs(os.path.dirname(con_path), exist_ok=True)
+                rt.build_connections_index(con_path)
+            if not os.path.exists(ACT_SCALE):
+                try:
+                    rt.build_act_scale(ACT_SCALE)
+                except Exception as e:
+                    import logging
+                    logging.warning("act_scale preload failed (offline?): %s", e)
+            rt.status = "ready"
+        except Exception as e:
+            rt.status = f"error: {e}"
     threading.Thread(target=go, daemon=True).start()
 
 

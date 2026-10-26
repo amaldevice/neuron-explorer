@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .DS_Store
+.codegraph/
 
 # sweep data and derived files
 runs/
@@ -8,6 +9,9 @@ stats/
 captures/
 logs/
 explorer/cache/connections.sqlite
+explorer/cache/*.npz
+explorer/cache/vocab.json
+explorer/cache/*/
 
 # third-party material
 source/
