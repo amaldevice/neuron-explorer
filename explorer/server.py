@@ -163,12 +163,29 @@ def index():
 def units(layer: int):
     d = load_layer(layer)
     if d is None:
+        st = rt.steer_index()
+        if st is not None and "up_kl" in st and "down_kl" in st and 0 <= layer < len(st["up_kl"]):
+            max_kl = np.maximum(st["up_kl"][layer], st["down_kl"][layer])
+            if np.any(max_kl > 0) or np.any(st.get("up", [])[layer] != 0) or np.any(st.get("down", [])[layer] != 0):
+                sorted_indices = np.argsort(-max_kl)
+                nm = names()
+                v = rt.vocab_strings()
+                return [
+                    {
+                        "n": int(n),
+                        "kind": "neuron",
+                        "z": float(max_kl[n]),
+                        "metric": "kl",
+                        "words": [v[int(t)] for t in (st["up"] if st["up_kl"][layer, n] >= st["down_kl"][layer, n] else st["down"])[layer, n, :5]],
+                        "name": nm.get(f"L{layer}/N{n}", ""),
+                    }
+                    for n in sorted_indices
+                ]
         return []
     nm = names()
     return [{"kind": u["kind"], "n": u["neuron"], "z": u.get("mass", u["z"]), "null_pct": u["null_pct"],
              "words": [w for w, _, _ in u["words"][:5]], "name": nm.get(f"L{layer}/N{u['neuron']}", "")}
             for u in d["units"]]
-
 
 @app.get("/api/unit")
 def unit(layer: int, n: int, kind: str = "neuron"):

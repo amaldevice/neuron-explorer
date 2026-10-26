@@ -80,6 +80,12 @@ class ModelAdapter:
 
     def eos_token_id(self):
         return self.tok.eos_token_id
+    def hook_mlp(self, layer, s):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        layer.mlp.gate_proj.register_forward_hook(lambda m, i, o: setattr(s, "gate", o))
+        layer.mlp.up_proj.register_forward_hook(lambda m, i, o: setattr(s, "up", o))
+        layer.mlp.down_proj.register_forward_pre_hook(lambda m, i: s.update(i[0]))
 
 
 class Lfm2Adapter(ModelAdapter):
@@ -119,6 +125,13 @@ class Lfm2Adapter(ModelAdapter):
         if a is not None:
             return a.out_proj.in_features // a.head_dim
         return 0
+
+    def hook_mlp(self, layer, s):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        layer.feed_forward.w1.register_forward_hook(lambda m, i, o: setattr(s, "gate", o))
+        layer.feed_forward.w3.register_forward_hook(lambda m, i, o: setattr(s, "up", o))
+        layer.feed_forward.w2.register_forward_pre_hook(lambda m, i: s.update(i[0]))
 
 
 class GraniteMoeHybridAdapter(ModelAdapter):
@@ -171,6 +184,15 @@ class GraniteMoeHybridAdapter(ModelAdapter):
         if m is not None:
             return m.num_heads
         raise ValueError(f"layer {layer} has neither self_attn nor mamba mixer")
+
+    def hook_mlp(self, layer, s):
+        if isinstance(layer, int):
+            layer = self.layers()[layer]
+        def hook_in(m, i, o):
+            g, u = o.chunk(2, dim=-1)
+            s.gate, s.up = g, u
+        layer.shared_mlp.input_linear.register_forward_hook(hook_in)
+        layer.shared_mlp.output_linear.register_forward_pre_hook(lambda m, i: s.update(i[0]))
 
 
 ADAPTERS = {
