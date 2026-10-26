@@ -9,7 +9,7 @@ import re
 
 import torch
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-0.8B")
+MODEL = os.environ.get("EXPLORER_MODEL", "LiquidAI/LFM2.5-350M")
 
 
 def model_slug(model_id):
@@ -74,6 +74,9 @@ class ModelAdapter:
             layer = self.layers()[layer]
         a = getattr(layer, "self_attn", None)
         return a.o_proj.in_features // a.head_dim if a is not None else layer.linear_attn.num_v_heads
+
+    def mixer(self, layer):
+        return self.mixer_out_proj(layer), self.n_heads(layer)
 
     def eos_token_id(self):
         return self.tok.eos_token_id
