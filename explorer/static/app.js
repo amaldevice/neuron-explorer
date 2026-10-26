@@ -53,7 +53,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
       return showTip(x, y, `L${p.layer}`, desc);
     }
     const u = state.unitMap[p.layer]?.get(p.n), key = `${p.layer}/${p.n}`;
-    const head = `L${p.layer} N${p.n}${u ? `  mass ${u.z.toFixed(1)}` : ""}`;
+    const head = `L${p.layer} N${p.n}${u ? `  ${u.metric === "kl" ? "kl" : "mass"} ${u.z.toFixed(1)}` : ""}`;
     const body = () => {
       const h = hoverCache.get(key), rows = [];
       if (u?.name) rows.push(`<div class="tname">${esc(u.name)}</div>`);
@@ -179,7 +179,7 @@ async function setLayer(l) {
   try { localStorage.setItem("ne.layer", l); } catch {}
   if (!state.units[l]) {
     if (!lensResults) $("#rows").innerHTML = `<li class="head">…</li>`;
-    const us = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
+    const us = await api(`/api/units?layer=${l}`);
     state.units[l] = us;
     state.unitMap[l] = new Map(us.filter(u => u.kind === "neuron").map(u => [u.n, u]));
     if (state.layer !== l) return;
@@ -370,14 +370,19 @@ function lensHTML() {
 function renderList() {
   $("#net").innerHTML = lensHTML() + webSummaryHTML();
   if (lensResults) return renderResults(lensResults, $("#rows"));
+  const raw = state.units[state.layer] || [];
+  if (!raw.length) {
+    $("#rows").innerHTML = `<li class="head">No sweep runs or steer lens generated for L${state.layer}.<br><span class="dim">Search tokens via lens box above, test with fires, or run steer_lens.py.</span></li>`;
+    return;
+  }
   const q = $("#filter").value.trim().toLowerCase(), showR = $("#show-random").checked;
-  const units = (state.units[state.layer] || []).filter(u => (showR || u.kind === "neuron") &&
+  const units = raw.filter(u => (showR || u.kind === "neuron") &&
     (!q || u.words.some(w => w.includes(q)) || u.name.toLowerCase().includes(q) || String(u.n) === q));
-  const rnd = (state.units[state.layer] || []).filter(u => u.kind === "random").map(u => u.z);
+  const rnd = raw.filter(u => u.kind === "random").map(u => u.z);
   const floor = rnd.length ? Math.max(...rnd) : -Infinity;
   const ol = $("#rows");
   ol.innerHTML = units.slice(0, 600).map(u => `<li data-n="${u.n}" data-kind="${u.kind}" class="${u.kind}${u.z <= floor ? " below" : ""}${state.focus && state.focus.n === u.n && state.focus.layer === state.layer && u.kind === "neuron" ? " sel" : ""}">
-    <span class="n">${u.kind === "random" ? "r" : "N"}${u.n}</span><span class="z">${u.z.toFixed(1)}</span>
+    <span class="n">${u.kind === "random" ? "r" : "N"}${u.n}</span><span class="z">${u.metric === "kl" ? `kl ${u.z.toFixed(1)}` : u.z.toFixed(1)}</span>
     <span class="w">${u.name ? `<b>${esc(u.name)}</b> ` : ""}${esc(u.words.join(" "))}</span></li>`).join("");
 }
 // lens hits (net tab) or what fired (run tab)
