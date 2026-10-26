@@ -17,11 +17,10 @@ import numpy as np
 import torch
 from fastapi.testclient import TestClient
 from transformers import AutoTokenizer
-
+os.environ["EXPLORER_MODEL"] = "Qwen/Qwen3.5-0.8B"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "explorer"))
-
 from explorer.models import ADAPTERS, adapter_for, arch_from_model_or_config, model_slug
 from explorer.runtime import MODEL, MODEL_CACHE, Runtime
 from explorer.server import app, PORT, rt

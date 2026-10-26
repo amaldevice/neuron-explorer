@@ -28,6 +28,7 @@ header { position: fixed; inset: 0 0 auto 0; height: 44px; display: flex; align-
 #jump { width: 120px; font-family: var(--mono); }
 #web-z { width: 44px; font-family: var(--mono); }
 #status { margin-left: auto; color: var(--dim); font-size: 12px; }
+#model-name { font-size: 12px; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 
 main, .view, canvas { position: absolute; inset: 0; }
 main { top: 44px; }  /* below the header, so the scene never draws behind its controls */
