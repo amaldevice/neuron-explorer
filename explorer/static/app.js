@@ -18,6 +18,11 @@ const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12,
 
 const index = await api("/api/index");
 const arch = index.arch;
+if ($("#model-name")) $("#model-name").textContent = `${index.model} · ${arch.n_layers}L · ${arch.inter}N`;
+if (Object.keys(index.layers).length === 0) {
+  const eb = $('button[data-view="embed"]');
+  if (eb) eb.style.display = "none";
+}
 const tip = $("#tip");
 
 // ---------- map ----------
@@ -236,7 +241,7 @@ async function runInfer(text, g) {
     const r = await api("/api/infer", { text });
     if (!stillWanted(g, "fires", text)) return;
     if (!r.ready) { $("#run-rows").innerHTML = `<li class="head">${esc(state.statusText || "measuring neuron ranges")}</li>`; return; }
-    state.inf = { ...state.inf, text, pos: -1, tokens: r.tokens };
+    state.inf = { ...state.inf, text, pos: -1, tokens: r.tokens, truncated: r.truncated };
     $("#inf-toks").innerHTML = r.tokens.map((t, i) => `<button data-i="${r.pos[i]}">${esc(t)}</button>`).join("");
   }
   await inferView(g);
@@ -299,7 +304,7 @@ async function inferView(g = qGen) {
     }
   }
   if (leftTab === "run") map.setMarks(marks.length > 40000 ? marks.sort((a, b) => b.w - a.w).slice(0, 40000) : marks);
-  fireResults = { ...r, fires: true, ready: true };
+  fireResults = { ...r, fires: true, ready: true, truncated: state.inf?.truncated };
   renderResults(fireResults, $("#run-rows"));
 }
 function halfToFloat(h) {
@@ -370,7 +375,8 @@ function renderResults(r, ol) {
     <span class="n">L${x.layer} N${x.n}</span><span class="sg ${x.sign === "+" ? "up" : "down"}">${r.fires ? `${x.sign === "+" ? "" : "−"}${x.score.toFixed(1)}×` : `${x.sign === "+" ? "+" : "−"}${x.rank + 1}`}</span>
     <span class="w">${r.fires ? `<span class="tk">"${esc(x.token)}"</span>` : ""}${x.name ? `<b>${esc(x.name)}</b> ` : ""}${esc(x.lens.join(" "))}</span></li>`).join("");
   const head = r.fires ? `${r.total ?? 0} neurons pass · score = activation ÷ its typical extreme` : `${r.total ?? 0} neurons · ${r.tokens ?? 0} tokens`;
-  ol.innerHTML = `<li class="head">${head}</li>` + rows;
+  const trunc = r.truncated ? `<div class="trunc-note dim" style="color:#ffb347;font-weight:bold;margin-top:2px">Text truncated to 1024 tokens</div>` : "";
+  ol.innerHTML = `<li class="head">${head}${trunc}</li>` + rows;
 }
 // a web-summary token searches the lens for it
 $("#net").addEventListener("click", e => {
@@ -526,12 +532,18 @@ function renderDetails(u) {
   const s = u.stats;
   let h = "";
   if (s) {
-    h += `<div class="lab">words</div><div class="crumbs">` + s.words.map(([w, c, z]) =>
-      `<span class="tok" title="${c} rollouts · z ${z.toFixed(1)} · ${esc((s.per_prompt[w] || []).join(" "))}">${esc(w)}</span>`).join("") + `</div>`;
-    h += `<table class="dtable"><tr><th class="num">dose</th><th class="num">push</th><th class="num">distinct-4</th><th class="num">capped</th><th class="num">logprob</th></tr>` +
-      Object.entries(s.dose).map(([d, v]) => `<tr><td class="num">${d}</td><td class="num">${v.rel_push.toFixed(2)}</td><td class="num">${v.distinct4.toFixed(2)}</td><td class="num">${(v.capped * 100).toFixed(0)}%</td><td class="num">${v.logprob.toFixed(2)}</td></tr>`).join("") + `</table>`;
+    if (s.words && s.words.length) {
+      h += `<div class="lab">words</div><div class="crumbs">` + s.words.map(([w, c, z]) =>
+        `<span class="tok" title="${c} rollouts · z ${z.toFixed(1)} · ${esc((s.per_prompt[w] || []).join(" "))}">${esc(w)}</span>`).join("") + `</div>`;
+    }
+    if (s.dose && Object.keys(s.dose).length) {
+      h += `<table class="dtable"><tr><th class="num">dose</th><th class="num">push</th><th class="num">distinct-4</th><th class="num">capped</th><th class="num">logprob</th></tr>` +
+        Object.entries(s.dose).map(([d, v]) => `<tr><td class="num">${d}</td><td class="num">${v.rel_push.toFixed(2)}</td><td class="num">${v.distinct4.toFixed(2)}</td><td class="num">${(v.capped * 100).toFixed(0)}%</td><td class="num">${v.logprob.toFixed(2)}</td></tr>`).join("") + `</table>`;
+    }
   }
-  h += `<div id="d-lens" class="slot">—</div><div class="lab" style="margin-top:18px">connections</div><div id="d-con" class="slot">—</div>`;
+  h += `<div class="lab">Live Lens</div><div id="d-lens" class="slot">—</div>`;
+  h += `<div class="lab" style="margin-top:14px">Activation Range</div><div id="d-act" class="slot">${u.act_range ? `typical min ${u.act_range.act_min} · typical max ${u.act_range.act_max}` : "—"}</div>`;
+  h += `<div class="lab" style="margin-top:14px">Top Connections</div><div id="d-con" class="slot">—</div>`;
   $("#tab-details").innerHTML = h;
 }
 
@@ -549,6 +561,9 @@ async function loadLive(layer, n) {
   }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
   if (!lens) return;
   state.lens = { ...lens, layer, n }; renderList();
+  if (lens.act_range && $("#d-act")) {
+    $("#d-act").textContent = `typical min ${lens.act_range.act_min} · typical max ${lens.act_range.act_max} (${lens.act_range.over_tokens} tokens)`;
+  }
   const tok = t => `<span class="tok">${esc(t)}</span>`;
   const steer = lens.steer_up ? `<div class="lab">steer lens</div><div class="lens"><div class="up"><div class="lab">+ push · KL ${lens.kl_up}</div>${lens.steer_up.map(tok).join("")}</div><div class="down"><div class="lab">− push · KL ${lens.kl_down}</div>${lens.steer_down.map(tok).join("")}</div></div><div class="lab" style="margin-top:14px">logit lens</div>` : "";
   if ($("#d-lens")) $("#d-lens").outerHTML = `${steer}<div class="lens"><div class="up"><div class="lab">+</div>${lens.up.map(tok).join("")}</div><div class="down"><div class="lab">−</div>${lens.down.map(tok).join("")}</div></div>`;
