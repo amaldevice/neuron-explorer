@@ -459,24 +459,31 @@ const focusEl = $("#focus");
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
   if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
-document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
-const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
-const curTab = () => $("#tabs button.on")?.dataset.tab;
+document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => setTab(b.dataset.tab));
+const tabBtn = t => t ? $(`#tabs button[data-tab="${t}"]`) : null;
+const curTab = () => $("#tabs button[data-tab].on")?.dataset.tab;
 function setTab(t) {
+  if (!t) return;
   document.querySelectorAll("#tabs button[data-tab]").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.id === `tab-${t}`));
   focusEl.classList.toggle("on-claude", t === "claude");
-  tabBtn(t).classList.remove("fresh");
+  tabBtn(t)?.classList.remove("fresh");
   if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
 }
 // a tab that changed while another was showing gets a dot until opened
-function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
+function markFresh(t) { if (curTab() !== t) tabBtn(t)?.classList.add("fresh"); }
 // neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
 function syncTabs() {
   const f = state.focus;
-  for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
-  tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
-  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
+  for (const t of ["examples", "details"]) {
+    const b = tabBtn(t);
+    if (b) b.style.display = f ? "" : "none";
+  }
+  const cb = tabBtn("chat");
+  if (cb) cb.style.display = f && f.kind === "neuron" ? "" : "none";
+  const cur = curTab();
+  const curB = tabBtn(cur);
+  if (!curB || curB.style.display === "none") setTab(f ? "details" : "claude");
 }
 function openClaude() {
   focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
@@ -511,8 +518,9 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   renderExamples(u);
   renderDetails(u);
   const hasRollouts = !!(u.rollouts && u.rollouts.length);
-  document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
-  if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
+  const exBtn = tabBtn("examples");
+  if (exBtn) exBtn.style.display = hasRollouts ? "" : "none";
+  if (!hasRollouts && curTab() === "examples") setTab("details");
   if (kind === "neuron") loadLive(layer, n);
 }
 
