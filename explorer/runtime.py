@@ -517,6 +517,8 @@ class Runtime:
                     down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez(path, up=up, down=down)
+        if self.dev == "mps" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         self.status = "ready"
         return path
     # ---------- in-process direct-path top-k connections ----------
@@ -579,6 +581,9 @@ class Runtime:
             out[f"{side}_sign"] = bs.cpu().numpy()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez_compressed(path, **out, k=k)
+        del down, gates, ups, norm, best
+        if self.dev == "mps" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         self.status = "ready"
         return path
 
@@ -641,6 +646,8 @@ class Runtime:
                 break
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.savez(path, pos=pos, neg=neg, tokens=seen)
+        if self.dev == "mps" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         self.status = "ready"
         return path
 

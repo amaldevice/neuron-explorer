@@ -1320,6 +1320,8 @@ def preload():
                 except Exception as e:
                     import logging
                     logging.warning("act_scale preload failed (offline?): %s", e)
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
             rt.status = "ready"
         except Exception as e:
             rt.status = f"error: {e}"
